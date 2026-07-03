@@ -1281,6 +1281,62 @@ class FluentTelp:
         })
         return shaped
 
+    # ── Word problems: parse the story, do the arithmetic ──────────────
+    _NUM_WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4,
+                  "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+                  "ten": 10, "eleven": 11, "twelve": 12, "a dozen": 12,
+                  "thirteen": 13, "fourteen": 14, "fifteen": 15, "twenty": 20}
+    _WM_START = r"(?:have|has|had|start(?:ed)? with|there (?:are|were))"
+    _WM_MINUS = (r"(?:eat|eats|ate|eaten|lose|loses|lost|give[sn]? away|gave"
+                 r"(?: away)?|sell|sells|sold|drop(?:ped)?|use[sd]?|remove[sd]?"
+                 r"|break|broke|donate[sd]?)")
+    _WM_PLUS = (r"(?:buy|buys|bought|get|gets|got|find|finds|found|receive[sd]?"
+                r"|pick(?:ed)? up|gain(?:ed)?|add(?:ed)?|make|made|bake[sd]?)")
+
+    def _wm_num(self, tok: str):
+        tok = tok.lower().strip()
+        if tok.isdigit():
+            return int(tok)
+        return self._NUM_WORDS.get(tok)
+
+    def _word_math_route(self, user_msg: str, emotion) -> str | None:
+        q = user_msg.lower()
+        if not re.search(r"\bhow many\b.*\b(left|now|remain|total|in all"
+                         r"|altogether|does .* have|do .* have)\b", q):
+            return None
+        num = r"(\d+|" + "|".join(w for w in self._NUM_WORDS if w != "a") + r")"
+        start = re.search(self._WM_START + r"\s+" + num, q)
+        if not start:
+            return None
+        total = self._wm_num(start.group(1))
+        if total is None:
+            return None
+        steps = [f"start with {total}"]
+        tail = q[start.end():]
+        op_re = (r"\b(" + self._WM_MINUS + r"|" + self._WM_PLUS + r")\b"
+                 r"(?:\s+" + num + r")?")
+        for m in re.finditer(op_re, tail):
+            verb = m.group(1)
+            n = self._wm_num(m.group(2)) if m.group(2) else 1
+            if n is None:
+                n = 1
+            if re.fullmatch(self._WM_MINUS, verb):
+                total -= n
+                steps.append(f"minus {n} ({verb})")
+            else:
+                total += n
+                steps.append(f"plus {n} ({verb})")
+        if len(steps) < 2:
+            return None
+        body = f"{total} left - {', '.join(steps)} -> {total}."
+        shaped = self.voice.shape_response(body, band="high", emotion=emotion)
+        self.agent.turns.append({
+            "user": user_msg, "agent": shaped,
+            "retrieved_memories": steps, "similarity": 1.0,
+            "domain": "word_math", "emotion": emotion,
+        })
+        return shaped
+
     def _howto_miss(self, question: str, answer_text: str) -> bool:
         """Procedural questions demand the HOW be covered: egg biology must not
         satisfy 'how do I boil an egg' on any answer path."""
@@ -1447,6 +1503,34 @@ class FluentTelp:
         r"(?:.{0,20}?\babout\s+(?:a|an|the)?\s*([a-zA-Z][a-zA-Z ]{2,24}))?", re.I)
 
     def _story_route(self, user_msg: str, emotion) -> str | None:
+        q = user_msg.lower()
+        # story MEMORY: retell a remembered story / list what he's told
+        if re.search(r"\b(what|which) stories\b", q):
+            import sqlite3 as _sq
+            con = _sq.connect(str(self.agent.lattice.db_path))
+            rows = con.execute("SELECT source FROM memories WHERE source "
+                               "LIKE 'story:%' ORDER BY id").fetchall()
+            con.close()
+            seeds = list(dict.fromkeys(r[0].split(":", 1)[1] for r in rows))
+            if seeds:
+                return (f"I've made up {len(seeds)} so far - about "
+                        f"{', '.join(seeds)}. Want to hear one again, or "
+                        f"a new one?")
+            return "I haven't made up any stories yet - ask me for one!"
+        if re.search(r"\b(again|you told|you made up|that story)\b", q) \
+                and "story" in q:
+            import sqlite3 as _sq
+            con = _sq.connect(str(self.agent.lattice.db_path))
+            rows = con.execute("SELECT text, source FROM memories WHERE "
+                               "source LIKE 'story:%' ORDER BY id").fetchall()
+            con.close()
+            if rows:
+                pick = rows[-1]
+                for t, s in reversed(rows):     # named seed wins
+                    if s.split(":", 1)[1] in q:
+                        pick = (t, s)
+                        break
+                return pick[0]
         m = self._STORY_RE.search(user_msg)
         if not m:
             return None
@@ -1467,6 +1551,11 @@ class FluentTelp:
             return None
         arc = frames[0].get("_arc", "") if frames else ""
         body = f"Here's one I made up (about {seed}):\n\n{story}"
+        # a told story becomes a memory like any other experience
+        try:
+            self.agent.lattice.add(body, source=f"story:{seed}")
+        except Exception:
+            pass
         self.agent.turns.append({
             "user": user_msg, "agent": body,
             "retrieved_memories": [f"imagined: seed={seed} arc={arc}"],
@@ -1992,6 +2081,11 @@ class FluentTelp:
         ag = self._age_route(q_res, emotion)
         if ag is not None:
             return ag
+
+        # ── Word problems: parse the story, do the arithmetic ──────────
+        wm = self._word_math_route(q_res, emotion)
+        if wm is not None:
+            return wm
 
         # ── Analogies: look up the relationship in the dictionary ──────
         an = self._analogy_route(q_res, emotion)
