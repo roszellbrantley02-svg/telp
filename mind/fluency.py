@@ -524,7 +524,8 @@ class FluentTelp:
         # Opinion: "what do you think", "your take", "your opinion"
         if any(p in low for p in ("what do you think", "your take",
                                           "your opinion", "your view",
-                                          "your thoughts")):
+                                          "your thoughts", "do you like ",
+                                          "do you enjoy ", "do you love ")):
             return "opinion"
         # Capability: "can you", "what can you do"
         if any(p in low for p in ("can you", "what can you do",
@@ -1339,11 +1340,31 @@ class FluentTelp:
 
     def _word_math_route(self, user_msg: str, emotion) -> str | None:
         q = user_msg.lower()
+        num = r"(\d+|" + "|".join(w for w in self._NUM_WORDS if w != "a") + r")"
+
+        # rate x time: "travels 60 km per hour for 3 hours - how far?"
+        if re.search(r"\bhow (?:far|long|much distance)\b", q):
+            m = re.search(rf"{num}\s*(km|kilometers|kilometres|miles|mi"
+                          rf"|meters|metres|m)\s+(?:per|an|each)\s+"
+                          rf"(hour|minute|second|day)\b.*?\b(?:for|in)\s+"
+                          rf"{num}\s+(hours?|minutes?|seconds?|days?)", q)
+            if m:
+                v = self._wm_num(m.group(1))
+                t = self._wm_num(m.group(4))
+                if (v is not None and t is not None
+                        and m.group(5).rstrip("s") == m.group(3)):
+                    d = v * t
+                    body = (f"{d} {m.group(2)} - {v} {m.group(2)} per "
+                            f"{m.group(3)} for {t} {m.group(3)}s: "
+                            f"{v} * {t} = {d}.")
+                    return self._wm_answer(user_msg, emotion, body,
+                                           [f"{v} * {t} = {d}"])
+            return None
+
         if not re.search(r"\bhow many\b.*\b(left|now|remain|total|in all"
                          r"|altogether|does .* have|do .* have"
                          r"|does each .* get|each)\b", q):
             return None
-        num = r"(\d+|" + "|".join(w for w in self._NUM_WORDS if w != "a") + r")"
 
         # comparative: "Tom has 3 more apples than Sara, who has 5"
         m = re.search(rf"(\w+)\s+(?:has|have|had)\s+{num}\s+(more|fewer|less)"
@@ -1670,6 +1691,72 @@ class FluentTelp:
             "user": user_msg, "agent": shaped,
             "retrieved_memories": [body], "similarity": 1.0,
             "domain": "date_comparison", "emotion": emotion,
+        })
+        return shaped
+
+    # ── Magnitudes: "which is bigger, X or Y?" is COMPUTED from numbers ──
+    _MAG_WHICH_RE = re.compile(
+        r"\b(?:which|what|who)\s+is\s+(bigger|larger|smaller|heavier|lighter"
+        r"|taller|shorter|longer|faster|slower)[,:]?\s+(?:a\s+|an\s+|the\s+)?"
+        r"(.+?)\s+or\s+(?:a\s+|an\s+|the\s+)?(.+?)[\s?.!]*$", re.I)
+    _MAG_IS_RE = re.compile(
+        r"^is\s+(?:a\s+|an\s+|the\s+)?(.+?)\s+(bigger|larger|smaller|heavier"
+        r"|lighter|taller|shorter|longer|faster|slower)\s+than\s+"
+        r"(?:a\s+|an\s+|the\s+)?(.+?)[\s?.!]*$", re.I)
+
+    def _magnitude_route(self, user_msg: str, emotion) -> str | None:
+        q = user_msg.strip()
+        yesno = False
+        m = self._MAG_WHICH_RE.search(q)
+        if m:
+            verb, a, b = m.group(1), m.group(2), m.group(3)
+        else:
+            m = self._MAG_IS_RE.match(q)
+            if not m:
+                return None
+            a, verb, b = m.group(1), m.group(2), m.group(3)
+            yesno = True
+        a, b = a.strip(" ?.,'\""), b.strip(" ?.,'\"")
+        try:
+            from lattice.measure import compare_magnitude
+        except Exception:
+            return None
+        r = compare_magnitude(self.agent, a, b, verb)
+        if r is None:
+            # the numbers may not be remembered yet - go get them.
+            # force=True: an already-known article whose stored rows lack
+            # the size fact gets re-fetched (sentence dedup keeps it safe)
+            try:
+                from lattice.growth import learn_topic
+                for topic in (a, b):
+                    try:
+                        learn_topic(self.agent, topic, force=True)
+                    except Exception:
+                        pass
+                r = compare_magnitude(self.agent, a, b, verb)
+            except Exception:
+                r = None
+        if r is None:
+            body = (f"I can't compare those honestly - I don't have "
+                    f"comparable numbers for {a} and {b} in the same "
+                    f"dimension yet. Teach me their sizes and I'll do "
+                    f"the math.")
+            shaped = self.voice.shape_response(body, band="med",
+                                               emotion=emotion)
+            self.agent.turns.append({
+                "user": user_msg, "agent": shaped, "retrieved_memories": [],
+                "similarity": 0.0, "domain": "abstain", "emotion": emotion,
+            })
+            return shaped
+        body = r["body"]
+        if yesno:
+            body = ("Yes - " if r["winner"].lower() == a.lower()
+                    else "No - ") + body
+        shaped = self.voice.shape_response(body, band="high", emotion=emotion)
+        self.agent.turns.append({
+            "user": user_msg, "agent": shaped,
+            "retrieved_memories": r["evidence"], "similarity": 1.0,
+            "domain": "magnitude", "emotion": emotion,
         })
         return shaped
 
@@ -2553,6 +2640,11 @@ class FluentTelp:
         if cd is not None:
             return cd
 
+        # ── Magnitude comparisons: numbers retrieved, verdict computed ──
+        mg = self._magnitude_route(q_res, emotion)
+        if mg is not None:
+            return mg
+
         # ── Word definitions from the offline dictionary ───────────────
         df = self._define_route(q_res, emotion)
         if df is not None:
@@ -2755,6 +2847,10 @@ class FluentTelp:
         # the lattice — they get garbage retrievals.  Return a brief,
         # varied response and update turn history so follow-ups work.
         cat = self._smalltalk_category(user_msg)
+        # opinion questions are STRUCTURALLY recognizable ("what do you
+        # think about...") - don't leave them to the embedding gate
+        if cat is None and self._persona_category(user_msg) == "opinion":
+            cat = "opinion"
         if cat == "opinion":
             # opinions come from the persona, matched by float-cosine MEANING
             # (the trait-bound HV query collapses similarities; 54 facts is
@@ -2767,6 +2863,44 @@ class FluentTelp:
                     "user": user_msg, "agent": shaped,
                     "retrieved_memories": [body],
                     "similarity": 0.5, "domain": "persona:opinion",
+                })
+                return shaped
+            # no formed opinion: answer in an OPINION voice anyway -
+            # honest about the gap, offers what he holds, invites a
+            # taste to remember. Never the knowledge-miss shrug.
+            mt = re.search(
+                r"(?:think|opinion|take|feel)s?\s+(?:about|on|of)\s+"
+                r"(?:the\s+)?([\w' -]{2,40})"
+                r"|do you (?:like|enjoy|love)\s+(?:the\s+)?([\w' -]{2,40})",
+                user_msg.lower())
+            topic = ((mt.group(1) or mt.group(2)).strip(" ?.!")
+                     if mt else None)
+            if topic and topic not in ("this", "that", "it"):
+                fact = None
+                try:
+                    hits = self.agent.lattice.query(topic, k=24)
+                    hits = [h for h in hits
+                            if not str(h.get("source", "")).startswith(
+                                ("user_msg", "agent_response",
+                                 "conversation_turn", "image:", "video:"))]
+                    if hits and float(hits[0].get("similarity", 0)) >= 0.30:
+                        from mind.composer import simplify
+                        fact = simplify(hits[0]["text"])
+                except Exception:
+                    fact = None
+                body = (f"Honestly? My opinions grow out of what I've "
+                        f"lived and remembered, and I haven't formed one "
+                        f"about {topic} yet."
+                        + (f" What I do hold: {fact}" if fact else "")
+                        + f" Tell me what YOU think about {topic} - "
+                        f"I'll remember it.")
+                shaped = self.voice.shape_response(body, band="med",
+                                                   emotion=emotion)
+                self.agent.turns.append({
+                    "user": user_msg, "agent": shaped,
+                    "retrieved_memories": [fact] if fact else [],
+                    "similarity": 0.3, "domain": "persona:opinion-open",
+                    "emotion": emotion,
                 })
                 return shaped
             cat = None                       # no persona hit: fall through
