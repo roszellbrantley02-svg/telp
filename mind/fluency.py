@@ -553,6 +553,10 @@ class FluentTelp:
                      ("User works at", "You work at")):
             if fact.startswith(a):
                 return b + fact[len(a):]
+        if fact.startswith("User's "):
+            return "Your " + fact[len("User's "):]
+        if fact.startswith("User "):
+            return "You " + fact[len("User "):]
         return fact
 
     def _looks_about_user(self, msg: str) -> bool:
@@ -2047,6 +2051,16 @@ class FluentTelp:
         dfmap = getattr(self.agent.encoder, "doc_freq", {}) or {}
         rare = [w for w in re.findall(r"[a-z0-9']{4,}", target.lower())
                 if dfmap.get(w, 0) <= 15]
+        # CLAIM-LEVEL forgetting: "forget that Jupiter has 95 moons"
+        # names a VALUE - only rows carrying that value qualify. The
+        # true "115 known moons" row must never die for the 95 claim.
+        values = re.findall(r"\d[\d,]*(?:\.\d+)?", target)
+
+        def _has_value(text: str) -> bool:
+            if not values:
+                return True
+            found = set(re.findall(r"\d[\d,]*(?:\.\d+)?", text))
+            return any(v in found for v in values)
 
         def _gate_for(text: str) -> float:
             tl = text.lower()
@@ -2073,7 +2087,7 @@ class FluentTelp:
             for c, s in zip(cands, sims):
                 if float(s) > best_cos:
                     best_cos, best_txt = float(s), c["text"]
-                if float(s) >= _gate_for(c["text"]):
+                if float(s) >= _gate_for(c["text"]) and _has_value(c["text"]):
                     victims.append(c["id"])
         gone_texts += lat.delete_ids(victims[:5])
         # user-taught "remember that..." facts live in their own subspace
@@ -2082,7 +2096,7 @@ class FluentTelp:
             embs = _np.asarray(emb_fn([target] + uf._texts))
             sims = embs[1:] @ embs[0]
             uf_ids = [i for i, s, t in zip(uf._ids, sims, uf._texts)
-                      if float(s) >= _gate_for(t)][:5]
+                      if float(s) >= _gate_for(t) and _has_value(t)][:5]
             if uf_ids:
                 for fid in uf_ids:
                     idx = uf._ids.index(fid)
@@ -2381,6 +2395,16 @@ class FluentTelp:
                 best = scored[0][1]
             except Exception:
                 pass
+        # CONFLICTS ARE SURFACED, NOT SILENTLY RESOLVED: two source
+        # families asserting different counts -> newest answers, both
+        # get named with their provenance
+        conflict_note = None
+        if how_many:
+            try:
+                best, conflict_note = self._count_conflict(
+                    user_msg, focus, best, cohort)
+            except Exception:
+                conflict_note = None
         sim = float(best.get("similarity", 0.0))
         # FACET-AWARE MISS (2026-07-02): a topical answer is not an answering
         # answer. Every focus word must be covered in meaning-space - "who
@@ -2453,6 +2477,8 @@ class FluentTelp:
                 body = simplify(best["text"])
             except Exception:
                 body = best["text"].strip()
+        if conflict_note:
+            body += " " + conflict_note
         band = "high" if max(sim, top_sim) >= self._SEM_HIGH else "med"
         shaped = self.voice.shape_response(body, band=band, emotion=emotion)
         self.agent.turns.append({
@@ -2464,6 +2490,84 @@ class FluentTelp:
                                          else "semantic", "emotion": emotion,
         })
         return shaped
+
+    @staticmethod
+    def _src_family(source: str) -> str:
+        """wikipedia:Moons of Jupiter -> wikipedia:moons of jupiter;
+        user_taught -> user_taught. Same-article rows are one family -
+        '107 irregular moons' vs '115 moons' from one article is DETAIL,
+        not disagreement."""
+        return (source or "").strip().lower()
+
+    def _count_conflict(self, question: str, focus: list, best: dict,
+                        cohort: list):
+        """Different source families asserting different counts of the
+        same noun = a CONFLICT to surface, never to silently resolve.
+        Returns (preferred_row, note) - preferred is the epistemically
+        newest; note names both sides with source and date."""
+        import re as _re
+        # the counted noun is what follows "how many"
+        mq = _re.search(r"how many\s+([a-z]+)", question.lower())
+        noun = mq.group(1) if mq else (focus[-1] if focus else None)
+        if not noun:
+            return best, None
+        cnt_re = _re.compile(
+            r"\b(\d[\d,]{0,9})\s+(?:[a-z]+\s+){0,2}" + _re.escape(noun))
+
+        def _count_of(text):
+            m = cnt_re.search(text.lower())
+            return int(m.group(1).replace(",", "")) if m else None
+
+        best_n = _count_of(best["text"])
+        if best_n is None:
+            return best, None
+        rivals = []
+        for h in cohort:
+            if h is best or self._src_family(h.get("source", "")) == \
+                    self._src_family(best.get("source", "")):
+                continue
+            n = _count_of(h["text"])
+            if n is not None and n != best_n:
+                rivals.append((n, h))
+        if not rivals:
+            return best, None
+
+        def _epistemic_year(row) -> tuple:
+            # a date INSIDE the sentence ("as of 9 April 2026") is the
+            # claim's own timestamp and outranks a mere save-date
+            years = [int(y) for y in _re.findall(r"\b(19\d\d|20\d\d)\b",
+                                                 row["text"])]
+            if years:
+                return (max(years), 1)
+            try:
+                import sqlite3 as _sq
+                con = _sq.connect(str(self.agent.lattice.db_path))
+                r = con.execute("SELECT created_at FROM memories WHERE "
+                                "text=?", (row["text"],)).fetchone()
+                con.close()
+                if r and r[0]:
+                    return (int(str(r[0])[:4]), 0)
+            except Exception:
+                pass
+            return (0, 0)
+
+        rn, rival = rivals[0]
+        by, ry = _epistemic_year(best), _epistemic_year(rival)
+        newest, other = (best, rival) if by >= ry else (rival, best)
+        n_new = best_n if newest is best else rn
+        n_old = rn if newest is best else best_n
+
+        def _claim(row, n):
+            s = row.get("source", "") or ""
+            if s.startswith("user_taught"):
+                return f"you told me {n}"
+            return f"{s or 'an old conversation'} says {n}"
+
+        note = (f"(Careful - my memories disagree here: "
+                f"{_claim(other, n_old)}, while the newest - "
+                f"{_claim(newest, n_new)}. Both may have been right "
+                f"when written - these counts change.)")
+        return newest, note
 
     def _track_entities(self, question: str, reply: str) -> None:
         """Feed the agent's recent-entity stack after every answered turn, so
@@ -2511,6 +2615,32 @@ class FluentTelp:
         """
         creativity = max(0.0, min(1.0, float(creativity)))
 
+        # ── "remember that <WORLD fact>" is TEACHING, not a user fact:
+        # it belongs in the one lattice, dated and sourced, where it can
+        # meet (and disagree with) everything else he knows.
+        m_teach = re.match(r"^\s*remember\s+(?:that\s+)?(.+?)[\s.!]*$",
+                           user_msg, re.I)
+        if (m_teach and not re.search(r"\b(my|i|me|mine|we|our)\b",
+                                      m_teach.group(1), re.I)):
+            fact = m_teach.group(1).strip()
+            try:
+                self.agent.lattice.add(fact, source="user_taught")
+                try:
+                    self.agent.structured.add_sentence(fact,
+                                                       source="user_taught")
+                    self.agent.encoder.add_sentence(fact)
+                except Exception:
+                    pass
+                ack = "Got it - I'll remember that."
+                self.agent.turns.append({
+                    "user": user_msg, "agent": ack,
+                    "retrieved_memories": [fact], "similarity": 1.0,
+                    "domain": "teach",
+                })
+                return ack
+            except Exception:
+                pass
+
         # ── Capture user-facts from the message ─────────────────────
         # ("my name is X", "I have two cats", "remember I prefer Y")
         if self.user_facts is not None:
@@ -2522,6 +2652,13 @@ class FluentTelp:
                     # acknowledge the teaching instead of hunting for an answer
                     if not user_msg.rstrip().endswith("?"):
                         ack = "Got it - I'll remember that."
+                        olds = getattr(self.user_facts,
+                                       "last_superseded", [])
+                        if olds:
+                            prev = "; ".join(
+                                o.rstrip(".") for o in olds[:2])
+                            ack = (f"Got it - updated what I believe. "
+                                   f"(Previously: {prev}.)")
                         self.agent.turns.append({
                             "user": user_msg, "agent": ack,
                             "retrieved_memories": [], "similarity": 1.0,

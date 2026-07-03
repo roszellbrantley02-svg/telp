@@ -15,7 +15,8 @@ operation**:
 | **Reasoning** | deterministic computation over retrieved facts (math, dates, comparisons) |
 | **Speaking** | composition of known truths — never prediction of likely words |
 | **Growing** | fetches Wikipedia / wikiHow / URLs / YouTube himself when he doesn't know |
-| **Forgetting** | surgical deletion on command, provably |
+| **Forgetting** | surgical, claim-level deletion on command, provably |
+| **Believing** | conflicting memories surfaced with sources + dates; newest wins, history kept |
 
 The consequence: **Telp cannot hallucinate.** Structurally, not by policy. Every sentence
 he says is a memory he can cite (`how do you know that?` → *"from wikipedia:Iceland,
@@ -39,6 +40,19 @@ Jupiter is the fifth planet from the Sun, and the largest in the Solar System.
 Also, Jupiter is the third-brightest natural object in the Earth's night sky...
 On top of that, Jupiter's diameter is 11 times that of Earth.
    (three separate memories, composed into one voice - each one provable)
+
+> remember that Jupiter has 95 confirmed moons     (true in 2023!)
+Got it - I'll remember that.
+
+> how many moons does Jupiter have?
+There are 115 known moons of the planet Jupiter as of 9 April 2026.
+(Careful - my memories disagree here: you told me 95, while the newest -
+wikipedia:Moons of Jupiter says 115. Both may have been right when
+written - these counts change.)
+   (conflicting truths are SURFACED with sources and dates, never
+    silently resolved; corrections supersede: "my favorite color is
+    green" after "...blue" -> "Got it - updated what I believe.
+    (Previously: blue.)")
 
 > how do I boil an egg?
 I didn't know how, so I just looked it up and learned the steps.

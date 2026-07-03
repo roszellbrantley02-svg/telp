@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS user_facts (
     text        TEXT NOT NULL,
     hv          BLOB NOT NULL,
     source_msg  TEXT,
-    captured_at TEXT NOT NULL
+    captured_at TEXT NOT NULL,
+    superseded  INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_user_captured ON user_facts(captured_at);
 """
@@ -82,6 +83,11 @@ _FACT_PATTERNS = [
     (re.compile(r"\bi\s+work\s+(?:at|for)\s+([A-Za-z][A-Za-z\- &]+)",
                   re.IGNORECASE),
         "workplace"),
+    # "my X is Y" - the general attribute ("my favorite color is blue",
+    # "my dog's name is Astro")
+    (re.compile(r"\bmy\s+([a-z][\w' ]{2,28}?)\s+is\s+"
+                r"([\w][\w ,.'-]{0,40})", re.IGNORECASE),
+        "attribute"),
     # "remember that X" / "remember X"
     (re.compile(r"\bremember\s+(?:that\s+)?(.+)$", re.IGNORECASE),
         "remember"),
@@ -113,6 +119,11 @@ def extract_user_facts(msg: str) -> list[dict]:
                 text = f"User likes {captured_value}."
             elif kind == "workplace":
                 text = f"User works at {captured_value}."
+            elif kind == "attribute":
+                attr = m.group(1).strip().lower()
+                if attr in ("name",):        # covered by the name pattern
+                    continue
+                text = f"User's {attr} is {m.group(2).strip().rstrip('.,!?')}."
             elif kind == "remember":
                 text = f"User asked me to remember: {captured_value}."
             else:
@@ -135,7 +146,13 @@ class UserFactsStore:
                                           check_same_thread=False,
                                           timeout=30.0)
         self._con.executescript(_USER_SCHEMA)
+        try:    # migrate pre-Wire-27 stores
+            self._con.execute("ALTER TABLE user_facts ADD COLUMN "
+                              "superseded INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         self._con.commit()
+        self.last_superseded: list[str] = []
         self._ids: list[int] = []
         self._texts: list[str] = []
         self._stack: Optional[np.ndarray] = None
@@ -143,7 +160,8 @@ class UserFactsStore:
 
     def _reload(self):
         rows = self._con.execute(
-            "SELECT id, text, hv FROM user_facts ORDER BY id"
+            "SELECT id, text, hv FROM user_facts WHERE superseded=0 "
+            "ORDER BY id"
         ).fetchall()
         self._ids   = [r[0] for r in rows]
         self._texts = [r[1] for r in rows]
@@ -192,9 +210,30 @@ class UserFactsStore:
         facts = extract_user_facts(user_msg)
         existing = set(self._texts)
         added = []
+        self.last_superseded = []
+        # a new value for the SAME slot supersedes the old one - kept as
+        # history, no longer served ("my favorite color is green" after
+        # "...is blue": he remembers both, believes the newer)
+        _SUPERSEDE_KINDS = {"name", "occupation", "location", "workplace",
+                            "attribute"}
         for f in facts:
             if f["text"] in existing:
                 continue
+            if f["kind"] in _SUPERSEDE_KINDS and " is " in f["text"]:
+                slot = f["text"].split(" is ")[0] + " is "
+                olds = self._con.execute(
+                    "SELECT id, text FROM user_facts WHERE superseded=0 "
+                    "AND text LIKE ? AND text<>?",
+                    (slot + "%", f["text"])).fetchall()
+                for oid, otext in olds:
+                    self._con.execute(
+                        "UPDATE user_facts SET superseded=1 WHERE id=?",
+                        (oid,))
+                    self.last_superseded.append(otext)
+                if olds:
+                    self._con.commit()
+                    self._reload()
+                    existing = set(self._texts)
             try:
                 mid = self.add(f["text"], source_msg=user_msg)
                 added.append(mid)
