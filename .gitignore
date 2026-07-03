@@ -1,0 +1,46 @@
+# ── ALLOWLIST gitignore ──────────────────────────────────────────────
+# Everything is ignored by default. Only the public organism is tracked.
+# The private halves (state/ = Telp's actual memories, autopilot/ = the
+# retired trading lane, legacy scripts) can never enter the repo.
+*
+
+# repo meta
+!.gitignore
+!README.md
+!LICENSE
+!requirements.txt
+
+# the door
+!telp.py
+
+# the mind
+!mind/
+!mind/*.py
+
+# the substrate + organs
+!lattice/
+!lattice/*.py
+
+# the HDC primitive layer
+!train/
+!train/v5_hdc_prototype.py
+
+# the imagination lane drivers
+!tools/
+!tools/dream.py
+!tools/transform_lonely_bear.py
+
+# never, under any circumstances
+state/
+autopilot/
+__pycache__/
+*.pyc
+*.db
+*.pkl
+*.pt
+*.wav
+*.mp4
+
+# legacy exclusions: the old LLM-decoder REPL and trading-era fetcher
+lattice/agent.py
+lattice/fetch_finance.py

@@ -1,0 +1,18 @@
+# Core (the mind)
+numpy
+scipy
+Pillow
+
+# The semantic encoder (meaning -> hypervectors) and the sense organs.
+# torch: install the CUDA build matching your GPU for speed (CPU works too).
+torch
+sentence-transformers   # MiniLM text meaning
+transformers            # CLIP vision (zero-shot naming)
+
+# Optional senses - each degrades gracefully if missing:
+openai-whisper          # ears: hear videos without captions
+easyocr                 # reading eyes: text inside frames
+yt-dlp                  # watch YouTube videos (download)
+youtube-transcript-api  # read YouTube captions
+
+# ffmpeg must be on PATH (or set TELP_FFMPEG_DIR) for video watching/hearing.
