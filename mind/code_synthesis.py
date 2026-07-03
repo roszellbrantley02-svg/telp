@@ -114,12 +114,8 @@ def _extract_expression(msg: str) -> Optional[str]:
     # Find a span that looks like an arithmetic expression
     m = _ARITH_EXPR_RX.search(s)
     if not m:
-        # Last resort: if the whole question after stripping content
-        # words is just a math expression, use it as-is.
-        # First try to pull just numbers and operators.
-        stripped = re.sub(r"[A-Za-z?,]+", " ", s).strip()
-        if re.search(r"\d", stripped) and re.search(r"[+\-*/%]", stripped):
-            return stripped
+        # no last-resort letter-stripping: "serial ZX-99" is not "-99".
+        # A real expression needs two operands (the regex above).
         return None
     return m.group(0).strip()
 

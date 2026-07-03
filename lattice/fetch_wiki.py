@@ -70,6 +70,7 @@ def fetch_one(topic: str, timeout: float = 10.0) -> dict | None:
             "title": data.get("title", topic),
             "extract": data.get("extract", ""),
             "description": data.get("description", ""),
+            "type": data.get("type", ""),    # "disambiguation" -> not facts
         }
     except Exception as e:
         return {"topic": topic, "error": str(e)}

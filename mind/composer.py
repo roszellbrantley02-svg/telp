@@ -20,7 +20,8 @@ import re
 _PAREN_RE = re.compile(r"\s*\([^()]*\)")
 _OFFICIAL_RE = re.compile(
     r"^([A-Z][\w' -]{1,40}?),\s+(?:officially|formally|also known as|sometimes"
-    r" called)[^,]{0,80},\s+(is|was|are|were)\b")
+    r" called|commonly (?:referred to as|known as|called))[^,]{0,80},"
+    r"\s+(is|was|are|were)\b")
 _TOPIC_PRON_RE = re.compile(
     r"^(.{2,48}?):\s+(It|Its|He|His|She, |Her|They|Their)\b")
 

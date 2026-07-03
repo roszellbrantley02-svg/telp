@@ -631,11 +631,42 @@ class StandaloneAgent:
             # Fallback: most recent of any kind.
             return self._recent_entities[-1][0]
 
+        def _in_sentence_antecedent(before: str, tok: str) -> bool:
+            """A sentence that names its own subject keeps its pronouns:
+            'how old was Alexander Graham Bell when HE died?' must not
+            pull a stale entity off the stack; 'I have 2 apples and eat
+            5 of THEM' has its antecedent right there."""
+            seg = re.split(r"[.!?]", before)[-1]
+            if tok in ("he", "she", "his", "her", "hers", "him",
+                       "it", "its"):
+                for pm in re.finditer(
+                        r"\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+)*)", seg):
+                    if pm.group(1).lower() not in self._ENTITY_BLACKLIST:
+                        return True
+            if tok in ("they", "them", "their", "theirs"):
+                for nm in re.finditer(r"\b([a-z]{3,}s)\b", seg):
+                    w = nm.group(1)
+                    if w not in self._STOP and not w.endswith("ss"):
+                        return True
+            return False
+
+        resolved_kinds: set = set()
+
         def sub(m: re.Match) -> str:
             tok = m.group(1).lower()
+            pref = self._PRONOUN_KIND_PREFERENCE.get(tok, "any")
+            # once one pronoun of a kind is resolved, the rest of the
+            # query refers to IT in-sentence: "how old was he when he
+            # died?" -> "how old was Galileo when he died?" (not
+            # "...when Galileo died?", which no route parses)
+            if pref in resolved_kinds:
+                return m.group(0)
+            if _in_sentence_antecedent(query[:m.start()], tok):
+                return m.group(0)
             picked = pick_for(tok)
             if picked is None:
                 return m.group(0)
+            resolved_kinds.add(pref)
             if tok in self._POSSESSIVE_PRONOUNS:
                 return f"{picked}'s"
             return picked

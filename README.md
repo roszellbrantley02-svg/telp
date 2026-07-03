@@ -118,8 +118,9 @@ Design laws:
 - Conversation depth is retrieval-bounded; pronoun carry-over across long threads is
   imperfect.
 - Knowledge = what he has been fed plus what he looks up. He starts small.
-- Word-problem arithmetic covers gain/loss chains ("12 cookies, gave away 4,
-  ate 2"); multiplication/rate problems are not parsed yet.
+- Word-problem arithmetic covers gain/loss chains, multiplication ("3 boxes
+  of 6 eggs"), sharing/division, and comparatives ("Tom has 3 more than
+  Sara"); multi-step rate problems are not parsed yet.
 
 These are documented boundaries, not bugs: the trade for a mind that never bluffs.
 

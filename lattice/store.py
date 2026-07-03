@@ -112,6 +112,34 @@ class Lattice:
             self._stack = None
         self._push_to_device()
 
+    def delete_ids(self, ids: list[int]) -> list[str]:
+        """Surgical forgetting: remove specific memories by id. The ONE
+        exception to append-only, and only ever driven by an explicit
+        user command. Cleans image-bank rows for image-sourced memories.
+        Returns the forgotten texts."""
+        if not ids:
+            return []
+        idset = set(ids)
+        gone, img_paths = [], []
+        for mid, text, src in zip(self._ids, self._texts, self._sources):
+            if mid in idset:
+                gone.append(text)
+                if src.startswith("image:"):
+                    img_paths.append(src.split(":", 1)[1])
+        for mid in idset:
+            self._con.execute("DELETE FROM memories WHERE id=?", (mid,))
+        self._con.commit()
+        if img_paths:
+            img_db = self.db_path.replace(".db", "_images.db")
+            if Path(img_db).exists():
+                icon = sqlite3.connect(img_db)
+                for p in img_paths:
+                    icon.execute("DELETE FROM images WHERE image_path=?", (p,))
+                icon.commit()
+                icon.close()
+        self._reload_from_disk()
+        return gone
+
     def _push_to_device(self) -> None:
         """Mirror the in-memory stack on GPU as a torch.int8 tensor.
 

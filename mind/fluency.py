@@ -409,6 +409,18 @@ class FluentTelp:
     def _abstain(self) -> str:
         return self._rng.choice(_ABSTAIN_PHRASES)
 
+    def _mark_abstained(self, user_msg: str, emotion) -> None:
+        """An honest miss must leave an honest turn record: no retrieved
+        memories for 'how do you know?' to mis-cite later."""
+        if self.agent.turns and self.agent.turns[-1].get("user") == user_msg:
+            self.agent.turns[-1]["retrieved_memories"] = []
+            self.agent.turns[-1]["domain"] = "abstain"
+        else:
+            self.agent.turns.append({
+                "user": user_msg, "agent": "", "retrieved_memories": [],
+                "similarity": 0.0, "domain": "abstain", "emotion": emotion,
+            })
+
     # Common hedge openers — used to detect when the body ALREADY
     # carries a hedge so we don't stack a second one ("I believe I think").
     _HEDGE_DETECTORS = (
@@ -528,6 +540,19 @@ class FluentTelp:
                                           "do you prefer")):
             return "style"
         return None
+
+    @staticmethod
+    def _uf_voice(fact: str) -> str:
+        """Stored third-person user fact -> second-person speech."""
+        for a, b in (("User's name is", "Your name is"),
+                     ("User asked me to remember:", "You asked me to remember:"),
+                     ("User is a", "You're a"), ("User has", "You have"),
+                     ("User likes", "You like"),
+                     ("User lives in / is from", "You live in / are from"),
+                     ("User works at", "You work at")):
+            if fact.startswith(a):
+                return b + fact[len(a):]
+        return fact
 
     def _looks_about_user(self, msg: str) -> bool:
         """True if the question is asking about THE USER (recall of
@@ -1207,9 +1232,10 @@ class FluentTelp:
                 "feelings": ["i'm feeling sad today", "i am so frustrated",
                              "i had a rough day", "i'm really happy right now",
                              "i'm tired and stressed"],
-                "surprise_me": ["tell me something interesting",
+                "surprise_me": ["surprise me", "surprise me with something",
+                                "tell me something interesting",
                                 "teach me something new", "tell me a fun fact",
-                                "share something cool"],
+                                "share something cool", "amaze me"],
                 "opinion": ["what do you think about this?",
                             "what do you think about AI?",
                             "what's your opinion on that?",
@@ -1289,9 +1315,12 @@ class FluentTelp:
     _WM_START = r"(?:have|has|had|start(?:ed)? with|there (?:are|were))"
     _WM_MINUS = (r"(?:eat|eats|ate|eaten|lose|loses|lost|give[sn]? away|gave"
                  r"(?: away)?|sell|sells|sold|drop(?:ped)?|use[sd]?|remove[sd]?"
-                 r"|break|broke|donate[sd]?)")
+                 r"|break|broke|donate[sd]?|flew (?:away|off)|fl(?:y|ies) away"
+                 r"|ran (?:away|off)|escap(?:ed|es)|wander(?:ed)? off)")
+    # "gives ME 7 more" is a GAIN even though "gives away" is a loss
     _WM_PLUS = (r"(?:buy|buys|bought|get|gets|got|find|finds|found|receive[sd]?"
-                r"|pick(?:ed)? up|gain(?:ed)?|add(?:ed)?|make|made|bake[sd]?)")
+                r"|pick(?:ed)? up|gain(?:ed)?|add(?:ed)?|make|made|bake[sd]?"
+                r"|g[ai]ve[sn]? (?:me|us)|hand(?:s|ed)? (?:me|us))")
 
     def _wm_num(self, tok: str):
         tok = tok.lower().strip()
@@ -1299,12 +1328,70 @@ class FluentTelp:
             return int(tok)
         return self._NUM_WORDS.get(tok)
 
+    def _wm_answer(self, user_msg, emotion, body: str, steps: list) -> str:
+        shaped = self.voice.shape_response(body, band="high", emotion=emotion)
+        self.agent.turns.append({
+            "user": user_msg, "agent": shaped,
+            "retrieved_memories": steps, "similarity": 1.0,
+            "domain": "word_math", "emotion": emotion,
+        })
+        return shaped
+
     def _word_math_route(self, user_msg: str, emotion) -> str | None:
         q = user_msg.lower()
         if not re.search(r"\bhow many\b.*\b(left|now|remain|total|in all"
-                         r"|altogether|does .* have|do .* have)\b", q):
+                         r"|altogether|does .* have|do .* have"
+                         r"|does each .* get|each)\b", q):
             return None
         num = r"(\d+|" + "|".join(w for w in self._NUM_WORDS if w != "a") + r")"
+
+        # comparative: "Tom has 3 more apples than Sara, who has 5"
+        m = re.search(rf"(\w+)\s+(?:has|have|had)\s+{num}\s+(more|fewer|less)"
+                      rf"\s+\w+\s+than\s+(\w+),?\s+who\s+(?:has|have|had)"
+                      rf"\s+{num}", q)
+        if m:
+            a, d, rel, b, base = (m.group(1), self._wm_num(m.group(2)),
+                                  m.group(3), m.group(4),
+                                  self._wm_num(m.group(5)))
+            if d is not None and base is not None:
+                total = base + d if rel == "more" else base - d
+                op = "+" if rel == "more" else "-"
+                body = (f"{a.capitalize()} has {total} - {b.capitalize()} "
+                        f"has {base}, and {a.capitalize()} has {d} {rel}: "
+                        f"{base} {op} {d} = {total}.")
+                return self._wm_answer(user_msg, emotion, body,
+                                       [f"{b}: {base}", f"{rel} {d}",
+                                        f"= {total}"])
+
+        # division: "20 candies shared equally among 4 kids"
+        m = re.search(rf"{num}\s+(\w+)\s+(?:are\s+|is\s+|get\s+)?"
+                      rf"(?:shared|split|divided)\s+(?:equally\s+)?"
+                      rf"(?:among|between)\s+{num}", q)
+        if m:
+            a, thing, b = (self._wm_num(m.group(1)), m.group(2),
+                           self._wm_num(m.group(3)))
+            if a is not None and b:
+                each, rem = divmod(a, b)
+                body = (f"{each} each - {a} {thing} shared among {b}: "
+                        f"{a} / {b} = {each}"
+                        + (f" with {rem} left over." if rem else "."))
+                return self._wm_answer(user_msg, emotion, body,
+                                       [f"{a} / {b} = {each} r{rem}"])
+
+        # multiplication: "3 boxes with 6 eggs each"
+        m = re.search(rf"{num}\s+(\w+)\s+(?:with|of|containing|holding|having"
+                      rf"|(?:that\s+)?(?:has|have))\s+{num}\s+(\w+)(?:\s+each)?",
+                      q)
+        if m:
+            a, group, b, thing = (self._wm_num(m.group(1)), m.group(2),
+                                  self._wm_num(m.group(3)), m.group(4))
+            if a is not None and b is not None:
+                body = (f"{a * b} {thing} - {a} {group} times {b} {thing} "
+                        f"each: {a} * {b} = {a * b}.")
+                return self._wm_answer(user_msg, emotion, body,
+                                       [f"{a} * {b} = {a * b}"])
+
+        # gain/loss chain: "had 12 cookies, gave away 4 and ate 2"
         start = re.search(self._WM_START + r"\s+" + num, q)
         if not start:
             return None
@@ -1313,29 +1400,34 @@ class FluentTelp:
             return None
         steps = [f"start with {total}"]
         tail = q[start.end():]
-        op_re = (r"\b(" + self._WM_MINUS + r"|" + self._WM_PLUS + r")\b"
-                 r"(?:\s+" + num + r")?")
+        # the count can come before OR after the verb:
+        # "gave away 4" / "4 flew away"
+        op_re = (r"(?:" + num + r"\s+)?\b(" + self._WM_PLUS + r"|"
+                 + self._WM_MINUS + r")\b(?:\s+" + num + r")?")
         for m in re.finditer(op_re, tail):
-            verb = m.group(1)
-            n = self._wm_num(m.group(2)) if m.group(2) else 1
+            verb = m.group(2)
+            n = (self._wm_num(m.group(3)) if m.group(3)
+                 else self._wm_num(m.group(1)) if m.group(1) else 1)
             if n is None:
                 n = 1
-            if re.fullmatch(self._WM_MINUS, verb):
-                total -= n
-                steps.append(f"minus {n} ({verb})")
-            else:
+            if re.fullmatch(self._WM_PLUS, verb):
                 total += n
                 steps.append(f"plus {n} ({verb})")
+            else:
+                # counts of things live in the naturals - you cannot
+                # remove more than you have
+                if n > total:
+                    body = (f"That can't happen - you only have {total}, "
+                            f"so you can't {verb} {n}. At most {total} "
+                            f"can go, leaving 0.")
+                    return self._wm_answer(user_msg, emotion, body,
+                                           steps + [f"minus {n} impossible"])
+                total -= n
+                steps.append(f"minus {n} ({verb})")
         if len(steps) < 2:
             return None
         body = f"{total} left - {', '.join(steps)} -> {total}."
-        shaped = self.voice.shape_response(body, band="high", emotion=emotion)
-        self.agent.turns.append({
-            "user": user_msg, "agent": shaped,
-            "retrieved_memories": steps, "similarity": 1.0,
-            "domain": "word_math", "emotion": emotion,
-        })
-        return shaped
+        return self._wm_answer(user_msg, emotion, body, steps)
 
     # ── Procedures: how-to answered with STEPS, fetched on miss ───────
     # Only first-person task questions ("how do I...", "how to...") — a
@@ -1520,13 +1612,27 @@ class FluentTelp:
     _CMP_RE = re.compile(
         r"(?:was|is|did)\s+(.+?)\s+(born|die|died)\s+(before|after|earlier than|"
         r"later than)\s+(.+?)[\s?.!]*$", re.I)
+    # "who was born first, X or Y?" / "who died first, X or Y?"
+    _CMP_WHO_RE = re.compile(
+        r"\bwho\s+(?:was\s+)?(born|die|died)\s+(first|earlier|last|later)\b"
+        r"[,:\s]+(.+?)\s+or\s+(.+?)[\s?.!]*$", re.I)
 
     def _compare_dates_route(self, user_msg: str, emotion) -> str | None:
+        who = None
         m = self._CMP_RE.search(user_msg.strip())
         if not m:
-            return None
-        a, event, rel, b = (m.group(1).strip(" ?.,'\""), m.group(2).lower(),
-                            m.group(3).lower(), m.group(4).strip(" ?.,'\""))
+            w = self._CMP_WHO_RE.search(user_msg.strip())
+            if not w:
+                return None
+            event, order = w.group(1).lower(), w.group(2).lower()
+            a = w.group(3).strip(" ?.,'\"")
+            b = w.group(4).strip(" ?.,'\"")
+            rel = "before"
+            who = "first" if order in ("first", "earlier") else "last"
+        else:
+            a, event, rel, b = (m.group(1).strip(" ?.,'\""),
+                                m.group(2).lower(), m.group(3).lower(),
+                                m.group(4).strip(" ?.,'\""))
         try:
             from lattice.growth import find_life_dates, fmt_date, learn_topic
         except Exception:
@@ -1547,12 +1653,18 @@ class FluentTelp:
             body = f"I couldn't find {event} dates for: {', '.join(missing)}."
         else:
             first_is_a = vals[a] < vals[b]
-            before = rel.startswith(("before", "earlier"))
-            yes = first_is_a if before else not first_is_a
             verb = "was born" if key == "birth" else "died"
-            body = (f"{'Yes' if yes else 'No'} - {a} {verb} "
-                    f"{fmt_date(vals[a])}, {b} {verb} {fmt_date(vals[b])}, "
-                    f"so {a if first_is_a else b} came first.")
+            if who is not None:
+                winner = ((a if first_is_a else b) if who == "first"
+                          else (b if first_is_a else a))
+                body = (f"{winner} - {a} {verb} {fmt_date(vals[a])}, "
+                        f"{b} {verb} {fmt_date(vals[b])}.")
+            else:
+                before = rel.startswith(("before", "earlier"))
+                yes = first_is_a if before else not first_is_a
+                body = (f"{'Yes' if yes else 'No'} - {a} {verb} "
+                        f"{fmt_date(vals[a])}, {b} {verb} {fmt_date(vals[b])}, "
+                        f"so {a if first_is_a else b} came first.")
         shaped = self.voice.shape_response(body, band="high", emotion=emotion)
         self.agent.turns.append({
             "user": user_msg, "agent": shaped,
@@ -1727,7 +1839,21 @@ class FluentTelp:
                     embs = _np.asarray(emb_fn([user_msg] + rows))
                     sims = embs[1:] @ embs[0]
                     i = int(sims.argmax())
-                    if float(sims[i]) >= 0.35:
+                    # SAME FACET LAW as the semantic path: the just-learned
+                    # article's best row must COVER the question, or the
+                    # honest "learned it but can't answer" message wins -
+                    # never "NZ's tallest mountain -> NZ is an island".
+                    cov = 1.0
+                    focus = [w for w in re.findall(r"[a-z0-9']+",
+                                                   user_msg.lower())
+                             if w not in self._SEM_STOP and len(w) > 1]
+                    if focus:
+                        try:
+                            cov = self.agent.encoder.focus_alignment(
+                                focus, [rows[i]], reduce="min")[0]
+                        except Exception:
+                            pass
+                    if float(sims[i]) >= 0.35 and cov >= 0.42:
                         from mind.composer import simplify
                         body = simplify(rows[i])
                         self.agent.turns.append({
@@ -1788,17 +1914,28 @@ class FluentTelp:
                     gone = forget(db, video=stem)
                     body = (f"Done - I've forgotten the video '{stem}': "
                             f"{len(gone)} memories erased.")
-            else:
+            elif any(w in q for w in ("image", "photo", "picture", "sight")):
+                # sights: CLIP cross-modal search, gated at the recall
+                # threshold (the old 0.20 floor deleted wrong memories)
                 target = q.removeprefix("forget").strip(" :,.-")
                 for filler in ("that you saw", "what you saw", "seeing",
                                "about", "the "):
                     target = target.replace(filler, " ").strip()
                 if not target:
                     return None
-                gone = forget(db, query=target)
+                gone = forget(db, query=target, min_sim=0.26)
+                self.agent.lattice._reload_from_disk()
                 body = (f"Done - forgotten: "
                         f"{gone[0].removeprefix('Image: ')}." if gone else
-                        "I couldn't find a memory matching that to forget.")
+                        "I couldn't find a sight matching that to forget.")
+            else:
+                target = q.removeprefix("forget").strip(" :,.-")
+                for filler in ("that you saw", "what you saw",
+                               "about", "the fact that", "the "):
+                    target = target.replace(filler, " ").strip()
+                if not target:
+                    return None
+                body = self._forget_semantic(target)
         except Exception:
             return None
         shaped = self.voice.shape_response(body, band="high", emotion=emotion)
@@ -1807,6 +1944,78 @@ class FluentTelp:
             "similarity": 1.0, "domain": "forget", "emotion": emotion,
         })
         return shaped
+
+    def _forget_semantic(self, target: str) -> str:
+        """Forget from the ONE memory (and the user-facts store), but only
+        on a STRONG match - deletion never runs on a weak guess."""
+        import numpy as _np
+        lat = self.agent.lattice
+        emb_fn = getattr(self.agent.encoder, "_embed", None)
+        if emb_fn is None:
+            return "I can't safely match that memory right now."
+        # measured: true match 0.48-0.95, junk <=0.20. A RARE word from
+        # the command appearing verbatim in a row is strong evidence on
+        # its own ("forget the frelling fact" names the only frelling
+        # row he has) - it relaxes the gate to 0.32.
+        dfmap = getattr(self.agent.encoder, "doc_freq", {}) or {}
+        rare = [w for w in re.findall(r"[a-z0-9']{4,}", target.lower())
+                if dfmap.get(w, 0) <= 15]
+
+        def _gate_for(text: str) -> float:
+            tl = text.lower()
+            # a rare command word appearing verbatim (WHOLE word - "astro"
+            # must not match "astronaut") = strong evidence; without one,
+            # deletion demands a decisively strong match ("what is your
+            # name?" at 0.45 must never die for "forget ... named astro")
+            if any(re.search(rf"\b{re.escape(w)}s?\b", tl) for w in rare):
+                return 0.32
+            return 0.55
+
+        victims, gone_texts = [], []
+        best_txt, best_cos = None, 0.0
+        cands = lat.query(target, k=24)
+        # conversation echoes are not what "forget X" means - the fact
+        # rows are the target (echo text also survives in the
+        # conversation_turn rows regardless)
+        cands = [c for c in cands
+                 if not str(c.get("source", "")).startswith(
+                     ("user_msg", "agent_response"))]
+        if cands:
+            embs = _np.asarray(emb_fn([target] + [c["text"] for c in cands]))
+            sims = embs[1:] @ embs[0]
+            for c, s in zip(cands, sims):
+                if float(s) > best_cos:
+                    best_cos, best_txt = float(s), c["text"]
+                if float(s) >= _gate_for(c["text"]):
+                    victims.append(c["id"])
+        gone_texts += lat.delete_ids(victims[:5])
+        # user-taught "remember that..." facts live in their own subspace
+        if self.user_facts is not None and self.user_facts.count() > 0:
+            uf = self.user_facts
+            embs = _np.asarray(emb_fn([target] + uf._texts))
+            sims = embs[1:] @ embs[0]
+            uf_ids = [i for i, s, t in zip(uf._ids, sims, uf._texts)
+                      if float(s) >= _gate_for(t)][:5]
+            if uf_ids:
+                for fid in uf_ids:
+                    idx = uf._ids.index(fid)
+                    gone_texts.append(uf._texts[idx])
+                    uf._con.execute("DELETE FROM user_facts WHERE id=?",
+                                    (fid,))
+                uf._con.commit()
+                uf._reload()
+            best_here = float(sims.max()) if len(sims) else 0.0
+            if best_here > best_cos:
+                best_cos = best_here
+        if gone_texts:
+            shown = "; ".join(" ".join(t.split())[:90] for t in gone_texts[:3])
+            more = f" (+{len(gone_texts) - 3} more)" if len(gone_texts) > 3 else ""
+            return f"Done - forgotten: {shown}{more}."
+        close = (f" The closest I have is \"{best_txt[:90]}\" and it doesn't "
+                 f"match well enough to delete safely." if best_txt else "")
+        return (f"I couldn't find a memory matching '{target}' confidently "
+                f"enough to forget.{close} Say it more specifically and "
+                f"I will.")
 
     # ── Provenance route: "how do you know?" cites the actual sources ──
     _PROV_TRIGGERS = ("how do you know", "where did you learn", "your source",
@@ -1817,6 +2026,24 @@ class FluentTelp:
         q = user_msg.lower()
         if not any(t in q for t in self._PROV_TRIGGERS):
             return None
+
+        def _say(body: str) -> str:
+            shaped = self.voice.shape_response(body, band="high",
+                                               emotion=emotion)
+            self.agent.turns.append({
+                "user": user_msg, "agent": shaped, "retrieved_memories": [],
+                "similarity": 1.0, "domain": "provenance", "emotion": emotion,
+            })
+            return shaped
+
+        # nothing said yet / last answer was an honest miss: there is no
+        # claim to cite, and citing an OLDER turn would be misleading
+        if not self.agent.turns:
+            return _say("Know what? You haven't asked me anything yet - "
+                        "ask me a question first.")
+        if self.agent.turns[-1].get("domain") == "abstain":
+            return _say("That last one was an honest miss - I didn't claim "
+                        "anything, so there's nothing to cite.")
         mems = []
         for turn in reversed(self.agent.turns):
             mems = turn.get("retrieved_memories") or []
@@ -1972,18 +2199,25 @@ class FluentTelp:
         if _re.search(r"\b(born|die|died|invented|founded)\b.*\b(before|after|earlier|later)\b"
                       r"|\b(older|younger|earlier|later)\s+than\b", ql):
             return None                    # compare_qa territory
-        if _re.search(r"^(list|name)\s+(all|the|some)\b|\bhow many\b", ql):
-            return None                    # counting needs numbers, not prose
+        if _re.search(r"^(list|name)\s+(all|the|some)\b", ql):
+            return None
+        # counting needs NUMERIC EVIDENCE, not prose about the topic -
+        # but a blanket refusal starved "how many moons does Jupiter
+        # have?" of the stored "115 known moons" row. Filter, don't bail.
+        how_many = bool(_re.search(r"\bhow many\b", ql))
         if _re.search(r"\bis to\b.*\bas\b.*\bis to\b", ql):
             return None                    # analogy_qa territory
         try:
-            hits = self.agent.lattice.query(user_msg, k=14)
+            # query WIDE then filter: conversation echoes of the same
+            # question (user_msg rows at sim 1.0) must not crowd the
+            # knowledge rows out of the candidate set
+            hits = self.agent.lattice.query(user_msg, k=48)
         except Exception:
             return None
         hits = [h for h in hits
                 if not str(h.get("source", "")).startswith(
                     ("user_msg", "agent_response", "conversation_turn",
-                     "image:", "video:"))]
+                     "image:", "video:"))][:14]
         if not hits:
             return None
         top_sim = float(hits[0].get("similarity", 0.0))
@@ -1995,15 +2229,66 @@ class FluentTelp:
                   if float(h.get("similarity", 0)) >= max(self._SEM_FLOOR * 0.8,
                                                           0.7 * top_sim)]
         import re as _re
+        if how_many:
+            num_re = _re.compile(
+                r"\d|\b(?:one|two|three|four|five|six|seven|eight|nine|"
+                r"ten|eleven|twelve|dozen|hundred|thousand|million|"
+                r"billion)\b", _re.I)
+            cohort = [h for h in cohort if num_re.search(h["text"])]
+            if not cohort:
+                return None            # no numeric evidence -> honest miss
         focus = [w for w in _re.findall(r"[a-z0-9']+", user_msg.lower())
                  if w not in self._SEM_STOP and len(w) > 1]
+        # NAMED ENTITIES answer by MENTION, not vibe. A rare question word
+        # (low doc-freq) is an entity facet: "largest lake in Mongolia" can
+        # never be satisfied by a row that names only Azerbaijan.
+        ent_focus: list = []
+        dfmap = getattr(self.agent.encoder, "doc_freq", None)
+        if dfmap:
+            n_docs = max(1, getattr(self.agent.encoder, "n_docs", 1))
+            df_max = max(3, n_docs // 500)
+            ent_focus = [w for w in focus
+                         if len(w) >= 4 and dfmap.get(w, 0) <= df_max]
+
+        def _mentions_all(text: str) -> bool:
+            tl = text.lower()
+            return all((w[:5] if len(w) > 5 else w) in tl for w in ent_focus)
+
+        lead_words = [w for w in focus if len(w) >= 4]
+
+        def _entity_lead(text: str) -> bool:
+            toks = text.split()
+            if not (lead_words and toks):
+                return False
+            t0 = _re.sub(r"[^a-z0-9']", "", toks[0].lower())
+            return any(t0.startswith(w[:5]) for w in lead_words)
+
+        if ent_focus:
+            named = [h for h in cohort if _mentions_all(h["text"])]
+            if not named:
+                return None        # memory never NAMES it -> honest miss
+            cohort = named
         best = cohort[0]
         if focus and len(cohort) > 1 and hasattr(self.agent.encoder,
                                                  "focus_alignment"):
             try:
                 aligns = self.agent.encoder.focus_alignment(
                     focus, [h["text"] for h in cohort])
-                scored = [(float(h.get("similarity", 0)) + 0.35 * a, h)
+                # subject-position entity leads beat passing mentions:
+                # "Galileo ... was an astronomer" > "Life of Galileo is a
+                # play" - and a COUNT question wants the definite count,
+                # not an estimate ("expected to have about 100...")
+                hedge_re = _re.compile(
+                    r"\b(?:expected|estimated|about|around|approximately"
+                    r"|predicted|thought to|may have|up to)\b")
+                # (no lead bonus on counts: "Jupiter Icy Moons Explorer
+                # is..." must not outrank "There are 115 known moons...")
+                scored = [(float(h.get("similarity", 0)) + 0.35 * a
+                           + (0.35 if not how_many
+                              and _entity_lead(h["text"]) else 0.0)
+                           - (0.2 if how_many
+                              and hedge_re.search(h["text"].lower())
+                              else 0.0), h)
                           for h, a in zip(cohort, aligns)]
                 scored.sort(key=lambda x: -x[0])
                 best = scored[0][1]
@@ -2025,6 +2310,28 @@ class FluentTelp:
                     return None            # uncovered facet -> honest miss
             except Exception:
                 pass
+        # NEGATION IS A FACET the embedding cannot see: "what do raccoons
+        # NOT eat?" retrieves the same rows as the positive question. A
+        # positive fact must never be served as if it answered the negative
+        # - state the positive honestly and say so.
+        neg_re = _re.compile(r"\b(?:not|never|don'?t|doesn'?t|didn'?t|"
+                             r"won'?t|can'?t|cannot|isn'?t|aren'?t)\b")
+        if neg_re.search(ql) and not neg_re.search(best["text"].lower()):
+            from mind.composer import simplify
+            body = ("You're asking for a negative, and what I actually hold "
+                    "is the positive: " + simplify(best["text"]) +
+                    " Beyond that I can't honestly rule things in or out.")
+            shaped = self.voice.shape_response(body, band="med",
+                                               emotion=emotion)
+            self.agent.turns.append({
+                "user": user_msg, "agent": shaped,
+                "retrieved_memories": [{"text": best["text"],
+                                        "similarity": sim}],
+                "similarity": sim, "domain": "semantic:negation",
+                "emotion": emotion,
+            })
+            return shaped
+
         # ── THE COMPOSED VOICE (2026-07-03): speak a paragraph composed
         # from several diverse true facts, rewritten plain - instead of
         # quoting one encyclopedia sentence. Falls back to the single best
@@ -2032,11 +2339,22 @@ class FluentTelp:
         used = [best]
         emb_fn = getattr(self.agent.encoder, "_embed", None)
         composed = None
-        if emb_fn is not None:
+        # a count wants ONE precise number, not a composed paragraph
+        if emb_fn is not None and not how_many:
             try:
                 from mind.composer import compose_answer, simplify
-                # compose from the reranked cohort, best fact guaranteed in
-                pool = [best] + [h for h in cohort if h is not best][:7]
+                # compose from the reranked cohort, best fact guaranteed in -
+                # and EVERY member must cover the question's facets, not just
+                # the lead ("how do birds fly" must not stitch anatomy trivia)
+                pool = [h for h in cohort if h is not best][:7]
+                if focus and pool:
+                    try:
+                        covs = self.agent.encoder.focus_alignment(
+                            focus, [h["text"] for h in pool], reduce="min")
+                        pool = [h for h, c in zip(pool, covs) if c >= 0.45]
+                    except Exception:
+                        pass
+                pool = [best] + pool
                 composed = compose_answer(user_msg, pool, emb_fn)
             except Exception:
                 composed = None
@@ -2080,9 +2398,11 @@ class FluentTelp:
                 self.agent._push_entity(e)
 
     def respond(self, user_msg: str, creativity: float = 0.30) -> str:
+        self._last_q_resolved = user_msg
         reply = self._respond_routes(user_msg, creativity)
         try:
-            self._track_entities(user_msg, reply or "")
+            self._track_entities(self._last_q_resolved or user_msg,
+                                 reply or "")
         except Exception:
             pass
         return reply
@@ -2138,33 +2458,66 @@ class FluentTelp:
         if p is not None:
             return p
 
+        # ── The OPERATIVE QUESTION: a long ramble that ends in a real
+        # question is answered on that question, not on the embedding of
+        # the whole story about the cousin's neighbor.
+        q_base = user_msg
+        if len(user_msg.split()) > 25 and user_msg.rstrip().endswith("?"):
+            m_op = re.search(
+                r"(?:^|[.!?,:;]\s+)((?:what|who|where|when|which|how|why"
+                r"|do|does|did|is|are|was|were|can)\b[^.!?]{3,140}\?)\s*$",
+                user_msg, re.I)
+            if m_op:
+                q_base = m_op.group(1).strip()
+
         # ── Entity-aware follow-ups: resolve pronouns ONCE for every route
         # below ("how many moons does IT have?" -> "...does Jupiter have?").
         # The stack is fed by _track_entities after each answered turn.
-        q_res = user_msg
+        q_res = q_base
         try:
-            q_res, _did = self.agent._resolve_pronouns(user_msg)
-            if _did:
-                print(f"[fluency] follow-up resolved: {q_res!r}", flush=True)
+            q_res, _did = self.agent._resolve_pronouns(q_base)
         except Exception:
             pass
+        # the tracker must see what the routes saw, not the raw pronouns
+        self._last_q_resolved = q_res
 
         # ── User-facts recall FIRST (before persona).  "What's my name?"
         # / "what do you know about me?" must hit user_facts even if
         # the message superficially looks personal (contains "you").
-        if (self.user_facts is not None and self.user_facts.count() > 0
-                and self._looks_about_user(user_msg)):
-            hits = self.user_facts.query(user_msg, k=5)
-            if hits and hits[0]["similarity"] >= 0.16:
-                body = " ".join(h["text"] for h in hits[:3])
+        if self.user_facts is not None and self.user_facts.count() > 0:
+            uf_low = user_msg.lower()
+            uf_body, uf_used = None, []
+            # broad recall lists the facts - no similarity gate to defeat
+            if (self._looks_about_user(user_msg)
+                    and re.search(r"\b(remember|know)\b.*\bme\b", uf_low)):
+                uf_used = self.user_facts.all_facts()[-6:]
+                uf_body = ("Here's what I know about you: "
+                           + " ".join(self._uf_voice(t) for t in uf_used))
+            # targeted first-person questions check the store by float
+            # meaning (the bound-subspace similarity is too coarse a gate)
+            elif (re.search(r"\bmy\b|\bmine\b|\b(?:do|am|did|was) i\b",
+                            uf_low)
+                    and re.match(r"^(what|where|when|who|which|how|do|does"
+                                 r"|did|am|is|are|was)\b", uf_low)):
+                emb_fn = getattr(self.agent.encoder, "_embed", None)
+                uf = self.user_facts
+                if emb_fn is not None:
+                    import numpy as _np
+                    embs = _np.asarray(emb_fn([user_msg] + uf._texts))
+                    sims = embs[1:] @ embs[0]
+                    i = int(sims.argmax())
+                    if float(sims[i]) >= 0.45:
+                        uf_used = [uf._texts[i]]
+                        uf_body = self._uf_voice(uf._texts[i])
+            if uf_body:
                 shaped = self.voice.shape_response(
-                    body, band="high", emotion=emotion,
+                    uf_body, band="high", emotion=emotion,
                 )
                 self.agent.turns.append({
                     "user":               user_msg,
                     "agent":              shaped,
-                    "retrieved_memories": [h["text"] for h in hits],
-                    "similarity":         hits[0]["similarity"],
+                    "retrieved_memories": uf_used,
+                    "similarity":         1.0,
                     "domain":             "user_facts",
                     "emotion":            emotion,
                 })
@@ -2541,6 +2894,7 @@ class FluentTelp:
                 self._update_topic_words(learned)
                 return learned
             self.last_topic_words.clear()
+            self._mark_abstained(user_msg, emotion)
             return self._abstain()
 
         # Quality check on the raw agent output — block junk (prompt
@@ -2548,6 +2902,7 @@ class FluentTelp:
         # single-doc fallback path the same way multi-doc filters them.
         if self._md_text_quality(raw) < 0.5:
             self.last_topic_words.clear()
+            self._mark_abstained(user_msg, emotion)
             return self._abstain()
 
         sentences = _split_sentences(raw)

@@ -27,7 +27,8 @@ _STOP = frozenset(
     "will would can could should the a an of in on at to for from about with "
     "and or not no any some tell me you your it its they them i we us this "
     "that these those there here far away long old big biggest large largest "
-    "small smallest many much capital invented discovered eat live come".split())
+    "small smallest many much capital invented discovered eat live come "
+    "born died death dies percent number".split())
 
 
 def learn_topic(agent, topic: str, max_facts: int = 40, force: bool = False) -> dict:
@@ -42,6 +43,11 @@ def learn_topic(agent, topic: str, max_facts: int = 40, force: bool = False) -> 
     if not r or r.get("error") or not r.get("extract"):
         return {"title": topic, "added": 0,
                 "error": (r or {}).get("error", "no data")}
+    # a disambiguation index is a MENU, not knowledge - refuse it
+    if (r.get("type") == "disambiguation"
+            or re.search(r"may (?:also )?refer to\s*:", r["extract"][:200])):
+        return {"title": r.get("title", topic), "added": 0,
+                "error": "disambiguation page"}
     title = r["title"]
     # already known? (normalize spaces/underscores - old ingests used _)
     norm = title.replace(" ", "_").lower()
@@ -53,9 +59,13 @@ def learn_topic(agent, topic: str, max_facts: int = 40, force: bool = False) -> 
     sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", r["extract"])
              if len(s.strip()) > 30]
     n = 0
+    head = title.split()[0].lower()
     for s in sents[:max_facts]:
-        if s.lower().startswith(_PRON):
-            s = f"{title}: {s}"          # anchor coreference orphans
+        # anchor coreference orphans AND any sentence that never names
+        # its own article ("The seat of government is La Paz" must carry
+        # "Bolivia:" or the capital question can never find it)
+        if s.lower().startswith(_PRON) or head not in s.lower():
+            s = f"{title}: {s}"
         if s in existing:
             continue                     # sentence-level dedup
         agent.lattice.add(s, source=f"wikipedia:{title}")
