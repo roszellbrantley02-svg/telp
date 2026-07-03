@@ -1764,6 +1764,142 @@ class FluentTelp:
         })
         return shaped
 
+    # ── Roles: "who is the <role> of <entity>?" - claims are DATED, so
+    # conflicting names surface like conflicting counts, and "...in 2010?"
+    # selects the claim that was true THEN. Memory as a timeline.
+    _ROLE_RE = re.compile(
+        r"^who\s+(?:is|was)\s+(?:the\s+)?([a-z][\w ]{2,30}?)\s+of\s+"
+        r"(?:the\s+)?([\w .'-]{2,40}?)(?:\s+in\s+(\d{4}))?[\s?.!]*$", re.I)
+    _NAME_RUN = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b")
+
+    def _role_claims(self, role: str, entity: str) -> list:
+        """Rows asserting '<Name> ... <role>' for the entity. Returns
+        [{'name', 'year', 'dated', 'source', 'text'}] - year from the
+        text itself when present (the claim's own timestamp), else the
+        row's save date."""
+        import sqlite3 as _sq
+        ent_words = {w.lower() for w in re.findall(r"[\w]+", entity)}
+        ekey = entity.lower()[:5] if len(entity) > 5 else entity.lower()
+        try:
+            hits = self.agent.lattice.query(f"{role} of {entity}", k=48)
+        except Exception:
+            return []
+        claims = []
+        for h in hits:
+            if str(h.get("source", "")).startswith(
+                    ("user_msg", "agent_response", "conversation_turn",
+                     "image:", "video:")):
+                continue
+            tl = h["text"].lower()
+            if role.lower() not in tl or ekey not in tl:
+                continue
+            # the sentence must ASSERT the role-holding - a name merely
+            # near the role word is not a claim ("produced by James Wan"
+            # in an Aquaman synopsis does not crown James Wan king)
+            sent = next((s for s in re.split(r"(?<=[.!?])\s+", h["text"])
+                         if role.lower() in s.lower()), None)
+            if sent is None:
+                continue
+            NAME = r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})"
+            # only the ROLE word is case-tolerant; names stay strict
+            r_esc = (f"[{role[0].upper()}{role[0].lower()}]"
+                     + re.escape(role[1:].lower()))
+            assert_pats = (
+                # "Donald Trump is the president", "Lincoln was the 16th president"
+                rf"{NAME}\s+(?:is|was|became|remains)\s+(?:the\s+)?"
+                rf"(?:\d+\w*\s+)?{r_esc}\b",
+                rf"{NAME}\s+(?:serves?|served)\s+as\s+(?:the\s+)?{r_esc}\b",
+                # "the president of the United States was Barack Obama"
+                rf"{r_esc}\s+of\s+[\w .'-]{{2,40}}?\s+(?:is|was)\s+{NAME}",
+            )
+            best_name = None
+            for pat in assert_pats:
+                for m in re.finditer(pat, sent):
+                    cand = m.group(1)
+                    if "  " in cand:
+                        continue
+                    toks = {w.lower() for w in cand.split()}
+                    if toks & ent_words:
+                        continue
+                    if cand.split()[0] in ("The", "A", "An", "In", "On",
+                                           "At", "Under", "With", "By"):
+                        continue
+                    best_name = cand
+                    break
+                if best_name:
+                    break
+            if best_name is None:
+                continue
+            years = [int(y) for y in re.findall(r"\b(1[5-9]\d\d|20\d\d)\b",
+                                                h["text"])]
+            if years:
+                year, dated = max(years), True
+            else:
+                year, dated = 0, False
+                try:
+                    con = _sq.connect(str(self.agent.lattice.db_path))
+                    r = con.execute("SELECT created_at FROM memories "
+                                    "WHERE text=?", (h["text"],)).fetchone()
+                    con.close()
+                    if r and r[0]:
+                        year = int(str(r[0])[:4])
+                except Exception:
+                    pass
+            claims.append({"name": best_name, "year": year, "dated": dated,
+                           "source": h.get("source", ""), "text": h["text"]})
+        return claims
+
+    def _role_route(self, user_msg: str, emotion) -> str | None:
+        m = self._ROLE_RE.match(user_msg.strip())
+        if not m:
+            return None
+        role, entity = m.group(1).strip(), m.group(2).strip()
+        asked_year = int(m.group(3)) if m.group(3) else None
+        claims = self._role_claims(role, entity)
+        if not claims:
+            return None                     # semantic path handles it
+        if asked_year is not None:
+            # the claim that was true THEN: newest dated claim <= year,
+            # else the closest dated claim
+            dated = [c for c in claims if c["dated"]]
+            if not dated:
+                return None
+            past = [c for c in dated if c["year"] <= asked_year]
+            pick = (max(past, key=lambda c: c["year"]) if past
+                    else min(dated, key=lambda c: abs(c["year"] - asked_year)))
+            body = (f"In {asked_year}: {pick['name']} - my closest dated "
+                    f"memory ({pick['source']}, {pick['year']}) says "
+                    f"\"{pick['text'][:160].strip()}\"")
+            used = [pick["text"]]
+        else:
+            names = {}
+            for c in claims:
+                names.setdefault(c["name"], []).append(c)
+            newest = max(claims, key=lambda c: (c["year"], c["dated"]))
+            if len(names) > 1:
+                others = sorted(
+                    (max(cs, key=lambda c: c["year"])
+                     for n, cs in names.items() if n != newest["name"]),
+                    key=lambda c: -c["year"])[:2]
+                listed = "; ".join(f"{c['name']} per {c['source'] or 'you'}"
+                                   f" ({c['year']})" for c in others)
+                body = (f"The newest I hold: {newest['name']} "
+                        f"({newest['source']}, {newest['year']}). Careful "
+                        f"- my memories disagree here: {listed}. Roles "
+                        f"change hands; each was likely right in its day.")
+            else:
+                body = (f"{newest['name']} - per {newest['source']} "
+                        f"({newest['year']}).")
+            used = [newest["text"]]
+        shaped = self.voice.shape_response(body, band="high",
+                                           emotion=emotion)
+        self.agent.turns.append({
+            "user": user_msg, "agent": shaped,
+            "retrieved_memories": used, "similarity": 1.0,
+            "domain": "role", "emotion": emotion,
+        })
+        return shaped
+
     # ── Definitions: the 1.75M-word offline Wiktionary answers instantly ──
     _DEFINE_RE = re.compile(
         r"^(?:define\s+|what\s+does\s+)['\"]?([a-zA-Z][a-zA-Z\-']{2,30})['\"]?"
@@ -1915,6 +2051,21 @@ class FluentTelp:
                     break
         if not learned_titles:
             return None
+        # a ROLE question demands a NAME holding the role - a media
+        # title containing the words ("Aquaman: King of Atlantis" the
+        # TV series) covers every word and answers nothing. Answer via
+        # the role machinery or admit the miss; never serve a synopsis.
+        mrole = self._ROLE_RE.match(user_msg.strip())
+        if mrole:
+            out = self._role_route(user_msg, emotion)
+            if out is not None:
+                return f"I didn't have that, so I just looked it up. {out}"
+            title, _n = learned_titles[0]
+            return (f"I didn't know, so I read about '{title}' - but I "
+                    f"still don't hold a name for the "
+                    f"{mrole.group(1).strip()} of "
+                    f"{mrole.group(2).strip()}. Ask me about {title} "
+                    f"though.")
         # answer from what was just learned (stack updates live)
         sem = self._semantic_answer(user_msg, emotion)
         title, n = learned_titles[0]
@@ -2414,9 +2565,16 @@ class FluentTelp:
                 cov = self.agent.encoder.focus_alignment(
                     focus, [best["text"]], reduce="min")[0]
                 # procedural how-to questions demand tight coverage: egg BIOLOGY
-                # must not satisfy "how do I boil an egg" - miss -> lookup
-                bar = 0.55 if re.match(r"^how (do|to|can|would|should)",
-                                       user_msg.lower()) else 0.42
+                # must not satisfy "how do I boil an egg" - miss -> lookup.
+                # role-shaped who-questions too: "king of Atlantis" must not
+                # be satisfied by Atlantis-myth prose (junk 0.44, legit 0.57)
+                if re.match(r"^how (do|to|can|would|should)",
+                            user_msg.lower()):
+                    bar = 0.55
+                elif self._ROLE_RE.match(user_msg.strip()):
+                    bar = 0.50
+                else:
+                    bar = 0.42
                 if cov < bar:
                     return None            # uncovered facet -> honest miss
             except Exception:
@@ -2694,6 +2852,12 @@ class FluentTelp:
             if m_op:
                 q_base = m_op.group(1).strip()
 
+        # canonicalize "who is the author/writer of X" onto the wrote-verb
+        # path, which matches how books are actually described ("novel BY
+        # Natsume Soseki" - the word "author" rarely appears in the row)
+        q_base = re.sub(r"^who\s+(?:is|was)\s+the\s+(?:author|writer)\s+of\b",
+                        "who wrote", q_base, flags=re.I)
+
         # ── Entity-aware follow-ups: resolve pronouns ONCE for every route
         # below ("how many moons does IT have?" -> "...does Jupiter have?").
         # The stack is fed by _track_entities after each answered turn.
@@ -2781,6 +2945,11 @@ class FluentTelp:
         mg = self._magnitude_route(q_res, emotion)
         if mg is not None:
             return mg
+
+        # ── Roles across time: dated claims, conflicts surfaced ────────
+        ro = self._role_route(q_res, emotion)
+        if ro is not None:
+            return ro
 
         # ── Word definitions from the offline dictionary ───────────────
         df = self._define_route(q_res, emotion)
