@@ -183,6 +183,12 @@ class UserFactsStore:
         repeats."""
         if not user_msg:
             return []
+        # questions and hypotheticals are not facts about the user
+        # ("if I have 3 apples and eat one, how many are left?")
+        low = user_msg.strip().lower()
+        if low.endswith("?") or low.startswith(("if ", "what if", "suppose",
+                                                "imagine", "say ")):
+            return []
         facts = extract_user_facts(user_msg)
         existing = set(self._texts)
         added = []

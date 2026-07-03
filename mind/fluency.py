@@ -1529,6 +1529,30 @@ class FluentTelp:
         sem = self._semantic_answer(user_msg, emotion)
         title, n = learned_titles[0]
         if sem is None:
+            # rank the NEW article's own rows against the question directly
+            emb_fn = getattr(self.agent.encoder, "_embed", None)
+            rows = [t for t, s in zip(self.agent.lattice._texts,
+                                      self.agent.lattice._sources)
+                    if s == f"wikipedia:{title}"]
+            if emb_fn is not None and rows:
+                try:
+                    import numpy as _np
+                    embs = _np.asarray(emb_fn([user_msg] + rows))
+                    sims = embs[1:] @ embs[0]
+                    i = int(sims.argmax())
+                    if float(sims[i]) >= 0.35:
+                        from mind.composer import simplify
+                        body = simplify(rows[i])
+                        self.agent.turns.append({
+                            "user": user_msg, "agent": body,
+                            "retrieved_memories": [rows[i]],
+                            "similarity": float(sims[i]),
+                            "domain": "learned_on_miss", "emotion": emotion,
+                        })
+                        return (f"I didn't have that, so I just looked it up "
+                                f"and learned it. {body}")
+                except Exception:
+                    pass
             return (f"I didn't know, so I just read about '{title}' and "
                     f"remembered {n} facts - but I still can't answer that "
                     f"one directly. Ask me about {title} though.")
@@ -1740,7 +1764,8 @@ class FluentTelp:
         "were will would can could should the a an of in on at to for from "
         "about with and or not no any some tell me you your it its they them "
         "i we us this that these those there here "
-        "say said says speaker talk talked mention mentioned".split())
+        "say said says speaker talk talked mention mentioned "
+        "many much number have has".split())
 
     def _semantic_answer(self, user_msg: str, emotion) -> str | None:
         """Answer a knowledge question from meaning-based retrieval, with
@@ -1760,8 +1785,8 @@ class FluentTelp:
         if _re.search(r"\b(born|die|died|invented|founded)\b.*\b(before|after|earlier|later)\b"
                       r"|\b(older|younger|earlier|later)\s+than\b", ql):
             return None                    # compare_qa territory
-        if _re.search(r"^(list|name)\s+(all|the|some)\b|\bhow many\b.*\b(are|were|did|do)\b", ql):
-            return None                    # aggregate_qa territory
+        if _re.search(r"^(list|name)\s+(all|the|some)\b|\bhow many\b", ql):
+            return None                    # counting needs numbers, not prose
         if _re.search(r"\bis to\b.*\bas\b.*\bis to\b", ql):
             return None                    # analogy_qa territory
         try:
@@ -1848,7 +1873,34 @@ class FluentTelp:
         })
         return shaped
 
+    def _track_entities(self, question: str, reply: str) -> None:
+        """Feed the agent's recent-entity stack after every answered turn, so
+        pronoun follow-ups resolve ('tell me about Jupiter' -> 'how many moons
+        does IT have?'). Question entities outrank answer entities; answer
+        entities are used only when the question named nothing (e.g. 'what is
+        the biggest planet?' -> the answer's 'Jupiter' becomes the topic)."""
+        try:
+            from lattice.growth import extract_topics
+        except Exception:
+            return
+        q_ents = extract_topics(question, max_topics=2)
+        if q_ents:
+            for e in reversed(q_ents[1:]):
+                self.agent._push_entity(e)
+            self.agent._push_entity(q_ents[0])      # main subject = most recent
+        elif reply:
+            for e in extract_topics(reply.split(".")[0], max_topics=1):
+                self.agent._push_entity(e)
+
     def respond(self, user_msg: str, creativity: float = 0.30) -> str:
+        reply = self._respond_routes(user_msg, creativity)
+        try:
+            self._track_entities(user_msg, reply or "")
+        except Exception:
+            pass
+        return reply
+
+    def _respond_routes(self, user_msg: str, creativity: float = 0.30) -> str:
         """Apply fluency wrapping around the underlying agent.
 
         creativity is a continuous dial in [0, 1] from the query router:
@@ -1899,6 +1951,17 @@ class FluentTelp:
         if p is not None:
             return p
 
+        # ── Entity-aware follow-ups: resolve pronouns ONCE for every route
+        # below ("how many moons does IT have?" -> "...does Jupiter have?").
+        # The stack is fed by _track_entities after each answered turn.
+        q_res = user_msg
+        try:
+            q_res, _did = self.agent._resolve_pronouns(user_msg)
+            if _did:
+                print(f"[fluency] follow-up resolved: {q_res!r}", flush=True)
+        except Exception:
+            pass
+
         # ── User-facts recall FIRST (before persona).  "What's my name?"
         # / "what do you know about me?" must hit user_facts even if
         # the message superficially looks personal (contains "you").
@@ -1921,32 +1984,32 @@ class FluentTelp:
                 return shaped
 
         # ── Vision: "what did you see?" answers from sight memory ──────
-        v = self._vision_route(user_msg, emotion)
+        v = self._vision_route(q_res, emotion)
         if v is not None:
             return v
 
         # ── Ages and dates: retrieve the facts, COMPUTE the answer ─────
-        ag = self._age_route(user_msg, emotion)
+        ag = self._age_route(q_res, emotion)
         if ag is not None:
             return ag
 
         # ── Analogies: look up the relationship in the dictionary ──────
-        an = self._analogy_route(user_msg, emotion)
+        an = self._analogy_route(q_res, emotion)
         if an is not None:
             return an
 
         # ── Date comparisons: retrieve both sides, compute the answer ──
-        cd = self._compare_dates_route(user_msg, emotion)
+        cd = self._compare_dates_route(q_res, emotion)
         if cd is not None:
             return cd
 
         # ── Word definitions from the offline dictionary ───────────────
-        df = self._define_route(user_msg, emotion)
+        df = self._define_route(q_res, emotion)
         if df is not None:
             return df
 
         # ── Stories from the imagination engine ────────────────────────
-        st = self._story_route(user_msg, emotion)
+        st = self._story_route(q_res, emotion)
         if st is not None:
             return st
 
@@ -2196,12 +2259,7 @@ class FluentTelp:
         # legacy rerank/multidoc machinery was built to compensate for the
         # RI encoder and fights it. Scale: verbatim 1.0, true match
         # 0.37-0.55, unrelated <=0.15.
-        _q_resolved = user_msg
-        try:
-            _q_resolved, _ = self.agent._resolve_pronouns(user_msg)
-        except Exception:
-            pass
-        sem = self._semantic_answer(_q_resolved, emotion)
+        sem = self._semantic_answer(q_res, emotion)
         if sem is not None:
             self._update_topic_words(sem)
             return self._shape_by_creativity(sem, creativity)
@@ -2281,11 +2339,7 @@ class FluentTelp:
             # LEARN-ON-MISS (2026-07-02): before giving up, go find it -
             # fetch the topic (Wikipedia, attributed source), grow the
             # memory, answer from what was just learned.
-            try:
-                _q2, _ = self.agent._resolve_pronouns(user_msg)
-            except Exception:
-                _q2 = user_msg
-            learned = self._learn_on_miss(_q2, emotion)
+            learned = self._learn_on_miss(q_res, emotion)
             if learned is not None:
                 self._update_topic_words(learned)
                 return learned

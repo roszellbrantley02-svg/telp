@@ -128,9 +128,15 @@ def compose_answer(question: str, hits: list[dict], emb_fn,
     simple.sort(key=lambda s: 0 if _DEF_RE.match(s) else 1)
     # proper nouns = words seen capitalized mid-sentence anywhere in the facts
     keep = set()
+    lead_counts: dict = {}
     for s in simple:
         for w in re.findall(r"(?<=[a-z0-9,;] )[A-Z][\w'-]+", s):
             keep.add(w)
+        lw = s.split(" ", 1)[0].strip(",.;:")
+        if lw.lower() not in ("the", "a", "an", "it", "this", "these", "they"):
+            lead_counts[lw] = lead_counts.get(lw, 0) + 1
+    # a non-article word that BEGINS 2+ facts is a proper name (e.g. Jupiter)
+    keep.update(w for w, c in lead_counts.items() if c >= 2 and w[:1].isupper())
     rng = random.Random(seed + len(question))
     parts = [simple[0]]
     used = _CONNECTORS[1:]
