@@ -14,7 +14,7 @@ operation**:
 | **Answering** | retrieval by meaning, facet-checked, *cited* |
 | **Reasoning** | deterministic computation over retrieved facts (math, dates, comparisons) |
 | **Speaking** | composition of known truths — never prediction of likely words |
-| **Growing** | fetches Wikipedia / URLs / YouTube himself when he doesn't know |
+| **Growing** | fetches Wikipedia / wikiHow / URLs / YouTube himself when he doesn't know |
 | **Forgetting** | surgical deletion on command, provably |
 
 The consequence: **Telp cannot hallucinate.** Structurally, not by policy. Every sentence
@@ -39,6 +39,14 @@ Jupiter is the fifth planet from the Sun, and the largest in the Solar System.
 Also, Jupiter is the third-brightest natural object in the Earth's night sky...
 On top of that, Jupiter's diameter is 11 times that of Earth.
    (three separate memories, composed into one voice - each one provable)
+
+> how do I boil an egg?
+I didn't know how, so I just looked it up and learned the steps.
+To boil eggs: 1. Place 3-6 eggs in a pot and cover them with cold water.
+2. Bring the pot to boil, then turn off the heat and let it sit for 10 minutes. ...
+   (procedures come from wikiHow as ordered steps - and "boil an egg" will
+    never be answered with the scrambled-eggs recipe: the facet gate
+    rejects topical-but-wrong procedures)
 
 > forget the video you watched
 Done - I've forgotten the video 'sintel_480': 29 memories erased.
@@ -110,7 +118,8 @@ Design laws:
 - Conversation depth is retrieval-bounded; pronoun carry-over across long threads is
   imperfect.
 - Knowledge = what he has been fed plus what he looks up. He starts small.
-- Word-problem math ("3 apples, eat one") has no parser yet.
+- Word-problem arithmetic covers gain/loss chains ("12 cookies, gave away 4,
+  ate 2"); multiplication/rate problems are not parsed yet.
 
 These are documented boundaries, not bugs: the trade for a mind that never bluffs.
 

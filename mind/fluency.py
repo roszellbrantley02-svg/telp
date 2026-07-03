@@ -1337,6 +1337,104 @@ class FluentTelp:
         })
         return shaped
 
+    # ── Procedures: how-to answered with STEPS, fetched on miss ───────
+    # Only first-person task questions ("how do I...", "how to...") — a
+    # knowledge question like "how do plants make food" stays on the
+    # semantic/wiki path.
+    _HOWTO_TASK_RE = re.compile(
+        r"^how (?:to|do i|do we|can i|should i|would i)\b", re.I)
+
+    def _procedure_route(self, user_msg: str, emotion) -> str | None:
+        q = user_msg.lower()
+        # keep the promise: "...ask if you want the rest"
+        if (re.search(r"\b(?:rest|remaining|more)\b", q)
+                and re.search(r"\bsteps?\b|\brest\b", q)
+                and getattr(self, "_last_proc", None)
+                and self.agent.turns
+                and self.agent.turns[-1].get("domain") == "procedure"):
+            proc = self._last_proc
+            title, steps = proc["title"].lower(), proc["steps"]
+            rest = steps[5:]
+            if not rest:
+                return self.voice.shape_response(
+                    f"That was all of them - {len(steps)} steps in all.",
+                    band="high", emotion=emotion)
+            parts = [f"{n}. {re.split(r'(?<=[.!?]) ', t.strip())[0]}"
+                     for n, t in rest]
+            body = f"The rest of how to {title}: " + " ".join(parts)
+            shaped = self.voice.shape_response(body, band="high",
+                                               emotion=emotion)
+            self.agent.turns.append({
+                "user": user_msg, "agent": shaped,
+                "retrieved_memories":
+                    [f"How to {title}, step {n}: {t}" for n, t in rest],
+                "similarity": 1.0, "domain": "procedure", "emotion": emotion,
+            })
+            return shaped
+        if not self._HOWTO_TASK_RE.match(user_msg.strip()):
+            return None
+        if re.search(r"\b(you|your|telp)\b", q):
+            return None                     # about Telp, not a task
+        try:
+            from lattice.growth import procedure_steps, learn_howto
+        except Exception:
+            return None
+        focus = [w for w in re.findall(r"[a-z]{3,}", q)
+                 if w not in self._SEM_STOP]
+        proc = procedure_steps(self.agent, query=user_msg)
+        if proc is not None and focus:
+            # same law as the facet gate: a TOPICAL procedure is not THE
+            # procedure ("boil an egg" must not accept "scrambled eggs")
+            try:
+                # titles are near-canonical: true match >=0.9, wrong
+                # facet <=0.44 (boil-vs-scrambled measured 0.438)
+                cov = self.agent.encoder.focus_alignment(
+                    focus, ["how to " + proc["title"].lower()],
+                    reduce="min")[0]
+                if cov < 0.60:
+                    proc = None
+            except Exception:
+                pass
+        learned = ""
+        if proc is None:
+            # a SPECIFIC task earns a fetch; vague ones fall through
+            if len(focus) < 2:
+                return None
+            if not hasattr(self, "_howto_attempted"):
+                self._howto_attempted: set = set()
+            key = " ".join(sorted(focus))
+            if key in self._howto_attempted:
+                return None
+            self._howto_attempted.add(key)
+            try:
+                r = learn_howto(self.agent, user_msg)
+            except Exception:
+                return None
+            if not r.get("steps"):
+                return None
+            proc = {"title": r["title"],
+                    "steps": list(enumerate(r["steps"], 1))}
+            learned = ("I didn't know how, so I just looked it up and "
+                       "learned the steps. ")
+        title, steps = proc["title"].lower(), proc["steps"]
+        shown = steps[:5]
+        parts = []
+        for n, t in shown:
+            first = re.split(r"(?<=[.!?])\s+", t.strip())[0]
+            parts.append(f"{n}. {first}")
+        more = (f" (...and {len(steps) - 5} more steps - ask if you want "
+                f"the rest.)" if len(steps) > 5 else "")
+        body = f"{learned}To {title}: " + " ".join(parts) + more
+        self._last_proc = proc
+        shaped = self.voice.shape_response(body, band="high", emotion=emotion)
+        self.agent.turns.append({
+            "user": user_msg, "agent": shaped,
+            "retrieved_memories":
+                [f"How to {title}, step {n}: {t}" for n, t in shown],
+            "similarity": 1.0, "domain": "procedure", "emotion": emotion,
+        })
+        return shaped
+
     def _howto_miss(self, question: str, answer_text: str) -> bool:
         """Procedural questions demand the HOW be covered: egg biology must not
         satisfy 'how do I boil an egg' on any answer path."""
@@ -2086,6 +2184,11 @@ class FluentTelp:
         wm = self._word_math_route(q_res, emotion)
         if wm is not None:
             return wm
+
+        # ── How-to: answer with ordered steps, learn from wikiHow on miss
+        pr = self._procedure_route(q_res, emotion)
+        if pr is not None:
+            return pr
 
         # ── Analogies: look up the relationship in the dictionary ──────
         an = self._analogy_route(q_res, emotion)

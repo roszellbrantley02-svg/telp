@@ -189,6 +189,127 @@ def learn_url(agent, url: str, max_facts: int = 60) -> dict:
     return {"title": src, "added": n, "error": None if n else "no prose found"}
 
 
+# ─── Procedures: how-to knowledge from wikiHow (steps, in order) ─────
+# wikiHow's api.php is broken (HTTP 500), but its search page and article
+# pages parse cleanly. One search request + one article request per learn;
+# source recorded as wikihow:<slug> (content CC BY-NC-SA, attributed).
+
+_WH_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "telp-lattice-research/0.1 (educational use)"}
+_WH_SKIP = ("wikiHowTo", "Main-Page", "Special:", "Category:", "Terms-of-Use",
+            "About-wikiHow", "Contact-Us", "Create-an-Account")
+
+
+def _wh_get(url: str) -> str:
+    import urllib.request
+    req = urllib.request.Request(url, headers=_WH_UA)
+    with urllib.request.urlopen(req, timeout=15.0) as resp:
+        return resp.read(2_000_000).decode("utf-8", errors="replace")
+
+
+def _wh_clean_step(chunk: str, cap: int = 300) -> str:
+    """One '<div class=\"step\"...' chunk -> clean instruction text,
+    trimmed to a sentence boundary."""
+    c = chunk[:4000]
+    c = re.sub(r"(?s)<script.*?</script>", " ", c)
+    c = re.sub(r"\{\"smallUrl.*?\}", " ", c)            # embedded image JSON
+    c = re.sub(r"(?s)<[^>]+>", " ", c)
+    c = re.sub(r"&[a-z#0-9]+;", " ", c)
+    c = re.sub(r"X\s+(?:Trustworthy|Research|Expert)\s+[Ss]ource\b[^.]*", " ", c)
+    c = re.sub(r"\s+", " ", c).strip().lstrip('" >').strip()
+    if len(c) <= cap:
+        return c
+    cut = c[:cap]
+    dot = max(cut.rfind(". "), cut.rfind("! "))
+    return cut[:dot + 1] if dot > 40 else cut
+
+
+def learn_howto(agent, query: str, max_steps: int = 10) -> dict:
+    """Fetch a how-to procedure from wikiHow and remember its steps IN ORDER.
+    Returns {'title', 'slug', 'added', 'steps', 'error'}."""
+    import urllib.parse
+    try:
+        html = _wh_get("https://www.wikihow.com/wikiHowTo?search="
+                       + urllib.parse.quote_plus(query))
+    except Exception as e:
+        return {"title": query, "added": 0, "steps": [], "error": f"search: {e}"}
+    slugs = []
+    for m in re.finditer(r'href="https://www\.wikihow\.com/([A-Za-z0-9%\-]+)"', html):
+        s = m.group(1)
+        if s not in slugs and not any(x in s for x in _WH_SKIP):
+            slugs.append(s)
+    if not slugs:
+        return {"title": query, "added": 0, "steps": [], "error": "no article found"}
+    slug = slugs[0]
+    title = urllib.parse.unquote(slug).replace("-", " ")
+    src = f"wikihow:{slug}"
+    if src in agent.lattice._sources:
+        proc = procedure_steps(agent, slug=slug)
+        return {"title": title, "slug": slug, "added": 0,
+                "steps": [t for _, t in proc["steps"]] if proc else [],
+                "error": "already known"}
+    try:
+        page = _wh_get(f"https://www.wikihow.com/{slug}")
+    except Exception as e:
+        return {"title": title, "added": 0, "steps": [], "error": f"article: {e}"}
+    steps = []
+    for chunk in page.split('<div class="step')[1:]:
+        t = _wh_clean_step(chunk)
+        if len(t) > 40 and t not in steps:
+            steps.append(t)
+        if len(steps) >= max_steps:
+            break
+    if not steps:
+        return {"title": title, "added": 0, "steps": [], "error": "no steps parsed"}
+    for i, t in enumerate(steps, 1):
+        agent.lattice.add(f"How to {title.lower()}, step {i}: {t}", source=src)
+    agent.lattice.add(f"How to {title.lower()}: a {len(steps)}-step procedure "
+                      f"Telp learned from wikiHow.", source=src)
+    return {"title": title, "slug": slug, "added": len(steps) + 1,
+            "steps": steps, "error": None}
+
+
+_WH_STEP_RE = re.compile(r"^How to (.+), step (\d+): (.+)$", re.S)
+
+
+def procedure_steps(agent, query: str = None, slug: str = None) -> dict | None:
+    """A known procedure's ordered steps. By slug (exact) or by query
+    (best title via float-cosine, gate 0.60).
+    Returns {'title', 'slug', 'steps': [(n, text), ...]} or None."""
+    import urllib.parse
+    by_src: dict = {}
+    for t, s in zip(agent.lattice._texts, agent.lattice._sources):
+        if not s.startswith("wikihow:"):
+            continue
+        m = _WH_STEP_RE.match(t)
+        if m:
+            by_src.setdefault(s, []).append((int(m.group(2)), m.group(3)))
+    if not by_src:
+        return None
+
+    def _pack(src: str) -> dict:
+        sg = src.split(":", 1)[1]
+        return {"title": urllib.parse.unquote(sg).replace("-", " "),
+                "slug": sg, "steps": sorted(by_src[src])}
+
+    if slug is not None:
+        src = f"wikihow:{slug}"
+        return _pack(src) if src in by_src else None
+    emb_fn = getattr(agent.encoder, "_embed", None)
+    if emb_fn is None or not query:
+        return None
+    keys = list(by_src)
+    titles = ["how to " + k.split(":", 1)[1].replace("-", " ").lower()
+              for k in keys]
+    import numpy as _np
+    embs = _np.asarray(emb_fn([query] + titles))
+    sims = embs[1:] @ embs[0]
+    i = int(sims.argmax())
+    if float(sims[i]) < 0.60:
+        return None
+    return _pack(keys[i])
+
+
 _YT_ID_RE = re.compile(
     r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)([A-Za-z0-9_\-]{11})")
 
