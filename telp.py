@@ -22,9 +22,102 @@ _ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_ROOT))
 
 
+DAEMON_PORT = int(__import__("os").environ.get("TELP_PORT", "7580"))
+
+
 def _fluent():
     from mind.fluency import FluentTelp
     return FluentTelp()
+
+
+def _daemon_request(payload: dict, timeout: float = 120.0):
+    """Send one request to a running daemon. Returns dict or None (no daemon)."""
+    import json
+    import socket
+    try:
+        s = socket.create_connection(("127.0.0.1", DAEMON_PORT), timeout=0.4)
+    except OSError:
+        return None
+    try:
+        s.settimeout(timeout)
+        s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        return json.loads(buf.decode("utf-8")) if buf.strip() else None
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def cmd_serve(_args) -> int:
+    """Run Telp as a resident mind: boot once, answer in under a second.
+    `telp ask` auto-routes here when the daemon is up. Ctrl+C to stop."""
+    import json
+    import socket
+    print("[serve] waking Telp (one-time boot) ...", flush=True)
+    t = _fluent()
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", DAEMON_PORT))
+    srv.listen(4)
+    print(f"[serve] Telp is awake on 127.0.0.1:{DAEMON_PORT} - "
+          f"`python telp.py ask ...` is now instant. Ctrl+C to stop.", flush=True)
+    try:
+        while True:
+            conn, _ = srv.accept()
+            try:
+                conn.settimeout(600)
+                buf = b""
+                while not buf.endswith(b"\n"):
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                if not buf.strip():
+                    continue
+                req = json.loads(buf.decode("utf-8"))
+                if req.get("op") == "quit":
+                    conn.sendall(b'{"reply": "Telp going to sleep."}\n')
+                    break
+                # another process may have taught/learned/forgotten - resync
+                lat = t.agent.lattice
+                try:
+                    n_db = lat._con.execute(
+                        "SELECT COUNT(*) FROM memories").fetchone()[0]
+                    if n_db != len(lat._ids):
+                        print(f"[serve] memory changed on disk "
+                              f"({len(lat._ids)} -> {n_db}) - resyncing",
+                              flush=True)
+                        lat._reload_from_disk()
+                except Exception:
+                    pass
+                reply = t.respond(req.get("text", ""),
+                                  creativity=float(req.get("creativity", 0.30)))
+                conn.sendall((json.dumps({"reply": reply}) + "\n").encode("utf-8"))
+            except Exception as e:
+                try:
+                    conn.sendall((json.dumps(
+                        {"reply": f"(daemon error: {e})"}) + "\n").encode("utf-8"))
+                except OSError:
+                    pass
+            finally:
+                conn.close()
+    except KeyboardInterrupt:
+        print("\n[serve] Telp going to sleep.", flush=True)
+    finally:
+        srv.close()
+    return 0
+
+
+def cmd_stop(_args) -> int:
+    r = _daemon_request({"op": "quit"})
+    print(r["reply"] if r else "No daemon running.")
+    return 0
 
 
 def cmd_chat(_args) -> int:
@@ -35,8 +128,14 @@ def cmd_chat(_args) -> int:
 
 
 def cmd_ask(args) -> int:
+    text = " ".join(args.question)
+    # a running daemon answers in well under a second; else boot standalone
+    r = _daemon_request({"text": text, "creativity": args.creative})
+    if r is not None:
+        print(r["reply"])
+        return 0
     t = _fluent()
-    print(t.respond(" ".join(args.question), creativity=args.creative))
+    print(t.respond(text, creativity=args.creative))
     return 0
 
 
@@ -170,6 +269,10 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd")
 
     sub.add_parser("chat", help="interactive REPL").set_defaults(func=cmd_chat)
+    sub.add_parser("serve", help="run Telp as a resident mind (instant asks)"
+                   ).set_defaults(func=cmd_serve)
+    sub.add_parser("stop", help="put the resident Telp to sleep"
+                   ).set_defaults(func=cmd_stop)
     sp = sub.add_parser("ask", help="one-shot question")
     sp.add_argument("question", nargs="+")
     sp.add_argument("--creative", type=float, default=0.30,

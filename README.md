@@ -55,6 +55,10 @@ sampling, every word dictionary-justified), and remembers *you* across sessions.
 ```bash
 pip install -r requirements.txt
 python telp.py                       # talk (REPL)
+python telp.py serve                 # or: run him as a RESIDENT MIND -
+                                     # boot once, then every ask answers in
+                                     # ~0.1s and he resyncs his memory when
+                                     # other processes teach/learn/forget
 python telp.py ask "hello, who are you?"
 python telp.py see photo.jpg         # he looks, names, remembers
 python telp.py watch video.mp4       # scenes + speech + on-screen text
