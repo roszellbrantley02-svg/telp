@@ -51,9 +51,14 @@ def simplify(fact: str, max_len: int = 230) -> str:
     if len(s) > max_len:
         cut = s.rfind(",", 100, max_len)
         s = s[:cut] if cut > 100 else s[:max_len].rsplit(" ", 1)[0]
-        # never end on a dangler ("...distance from Earth of.")
-        s = re.sub(r"\s+(of|and|or|the|a|an|to|in|on|at|with|from|for|by|as"
-                   r"|its|their|his|her)$", "", s, flags=re.I) + "."
+        # never end on a dangler - iterate, because stripping one can
+        # expose another ("...to the receiving" -> "...to the" -> done)
+        _dangler = re.compile(
+            r"\s+(?:of|and|or|the|a|an|to|in|on|at|with|from|for|by|as"
+            r"|its|their|his|her|\w+ing)$", re.I)
+        while _dangler.search(s):
+            s = _dangler.sub("", s)
+        s += "."
     s = re.sub(r"\s+(of|and|or|the|a|an|to|in|on|at|with|from|for|by|as"
                r"|its|their|his|her)\s*[.]?$", "", s, flags=re.I)
     if s and s[-1] not in ".!?":

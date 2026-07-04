@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 
 from mind.composer import simplify
+from mind.restyle import restyle
 
 # essay-grade definition shapes: commas allowed in the subject ("The
 # raccoon, sometimes called..., is a mammal" is a definition too).
@@ -49,7 +50,15 @@ def _clean_sentence(raw: str) -> str | None:
     # "Raccoon: The kits are raised..." -> "The kits are raised..."
     # (simplify already substituted "Topic: It is..." pronoun forms)
     s = _ANCHOR_RE.sub("", s).strip()
+    # ingest artifacts: a section header glued to the sentence start
+    # ("Usage ASCII was first used...") - strip it
+    s = re.sub(r"^(?:Usage|History|Etymology|Overview|Background"
+               r"|Description|Terminology|Definition)\s+(?=[A-Z])", "", s)
     if len(s) < 25 or not s[0].isupper() and not s[0].isdigit():
+        return None
+    # rows truncated at a false sentence boundary ("...romanized: tele,
+    # lit.") are broken data, not prose
+    if re.search(r"\b(?:lit|cf|viz|romanized|e\.g|i\.e)\.?$", s.rstrip(".")):
         return None
     if s.count("(") != s.count(")") or s.lstrip().startswith(")"):
         return None
@@ -164,6 +173,7 @@ def compose_essay(agent, topic: str, emb_fn,
         return None
 
     used, paragraphs = [], []
+    n_restyled = 0
     for pi, c in enumerate(clusters):
         # within a cluster: diverse picks, near-duplicates dropped
         picked: list[int] = []
@@ -186,7 +196,15 @@ def compose_essay(agent, topic: str, emb_fn,
             continue
         # the topic's own definition leads its paragraph
         sents.sort(key=_def_rank)
-        para = _PARA_CONNECT[min(pi, len(_PARA_CONNECT) - 1)] + " ".join(sents)
+        # HIS voice: dictionary-licensed simplification + splits, each
+        # sentence verified by embedding round-trip (reverts on drift)
+        styled = []
+        for s in sents:
+            s2, k = restyle(s, emb_fn)
+            n_restyled += k
+            styled.append(s2)
+        para = (_PARA_CONNECT[min(pi, len(_PARA_CONNECT) - 1)]
+                + " ".join(styled))
         paragraphs.append(para)
 
     if len(paragraphs) < 2:
@@ -199,6 +217,9 @@ def compose_essay(agent, topic: str, emb_fn,
     srcs = sorted({_label(s) for _, s in used})
     outro = ("Every sentence above is a memory I hold, drawn from: "
              + "; ".join(srcs[:6])
-             + (" and more" if len(srcs) > 6 else "") + ".")
+             + (" and more" if len(srcs) > 6 else "") + "."
+             + ((" Rephrased only by dictionary-licensed rules, each "
+                 "verified to preserve the original meaning.")
+                if n_restyled else ""))
     essay = "\n\n".join(paragraphs) + "\n\n" + outro
     return essay, [t for t, _ in used], srcs
