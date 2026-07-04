@@ -265,6 +265,13 @@ def cmd_stats(_args) -> int:
 
 def main() -> int:
     import argparse
+    # Windows consoles default to cp1252 - an essay quoting Greek
+    # (telephone <- "tele") must not crash the door
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     ap = argparse.ArgumentParser(prog="telp", description="Telp - one door, one mind.")
     sub = ap.add_subparsers(dest="cmd")
 
