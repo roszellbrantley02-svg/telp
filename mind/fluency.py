@@ -1934,6 +1934,48 @@ class FluentTelp:
         })
         return shaped
 
+    # ── Essays: COMPILED from memory, never predicted. Every sentence
+    # in the output is a stored row cleaned by deterministic rules; the
+    # piece ends by citing its own sources.
+    _ESSAY_RE = re.compile(
+        r"\b(?:write|compose|draft)\b.{0,24}?\b(?:essay|article|piece|page"
+        r"|report|summary)\b.{0,12}?\b(?:about|on)\s+(?:the\s+)?"
+        r"([\w .'-]{2,40})", re.I)
+
+    def _essay_route(self, user_msg: str, emotion) -> str | None:
+        m = self._ESSAY_RE.search(user_msg)
+        if not m:
+            return None
+        topic = m.group(1).strip(" ?.!,'\"")
+        emb_fn = getattr(self.agent.encoder, "_embed", None)
+        if emb_fn is None:
+            return None
+        try:
+            from mind.writer import compose_essay
+        except Exception:
+            return None
+        r = compose_essay(self.agent, topic, emb_fn)
+        if r is None:
+            # too thin to write honestly - grow first, then retry once
+            try:
+                from lattice.growth import learn_topic
+                learn_topic(self.agent, topic, force=True)
+                r = compose_essay(self.agent, topic, emb_fn)
+            except Exception:
+                r = None
+        if r is None:
+            body = (f"I don't hold enough about {topic} to write honestly "
+                    f"- teach me or say 'learn {topic}' and I will.")
+            return self.voice.shape_response(body, band="med",
+                                             emotion=emotion)
+        essay, used, srcs = r
+        self.agent.turns.append({
+            "user": user_msg, "agent": essay[:200],
+            "retrieved_memories": used[:6], "similarity": 1.0,
+            "domain": "essay", "emotion": emotion,
+        })
+        return essay
+
     # ── Stories: dispatch to the REAL imagination engine, not n-gram babble ──
     _STORY_RE = re.compile(
         r"\b(?:tell|make\s+up|write|imagine|invent|dream\s+up)\b.{0,24}?\bstory\b"
@@ -2955,6 +2997,11 @@ class FluentTelp:
         df = self._define_route(q_res, emotion)
         if df is not None:
             return df
+
+        # ── Essays: compiled from memory, cited at the end ──────────────
+        es = self._essay_route(q_res, emotion)
+        if es is not None:
+            return es
 
         # ── Stories from the imagination engine ────────────────────────
         st = self._story_route(q_res, emotion)
