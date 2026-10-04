@@ -23,10 +23,18 @@ _PAREN_RE = re.compile(r"\s*\(([^()]*)\)")
 # liver damage)", "(until it was reclassified)") carries meaning and stays.
 _PAREN_NOISE_RE = re.compile(
     r"^\s*(?:pronounced|pronunciation|listen|ipa|lit\.|literally|abbr|"
-    r"abbreviated|also\s+spelled|from|latin|greek|ancient\s+greek|"
-    r"old\s+english|middle\s+english|french|german|spanish|italian|"
-    r"portuguese|dutch|arabic|hebrew|persian|russian|chinese|japanese|"
-    r"korean|sanskrit|hindi|born|n[ée]e|died|c\.|ca\.|circa|fl\.)\b", re.I)
+    r"abbreviated|also\s+spelled|c\.|ca\.|circa|fl\.)\b", re.I)
+# "(Icelandic: Ísland; ...)", "(Latin for 'world')" - a language gloss.
+# Only real language names count: "(Note: it is fatal to cats)" stays.
+_LANG_GLOSS_RE = re.compile(
+    r"^\s*(?:(?:ancient|old|middle|modern|classical|medieval|late|"
+    r"vulgar|biblical)\s+)?(?:icelandic|latin|greek|english|french|german|"
+    r"spanish|italian|portuguese|dutch|arabic|hebrew|persian|russian|"
+    r"chinese|mandarin|cantonese|japanese|korean|sanskrit|hindi|urdu|"
+    r"turkish|polish|czech|swedish|norwegian|danish|finnish|hungarian|"
+    r"irish|welsh|scottish\s+gaelic|norse|aramaic|egyptian|maori|hawaiian|"
+    r"swahili|vietnamese|thai|indonesian|malay|tagalog|ukrainian|romanian|"
+    r"catalan|basque|galician)\s*(?::|;|\bfor\b)", re.I)
 _PAREN_DATES_RE = re.compile(
     r"^\s*(?:c\.\s*|ca\.\s*)?\d{1,4}(?:\s*(?:BCE?|AD|CE))?"
     r"(?:\s*[-\u2013\u2014/]\s*(?:c\.\s*)?\d{1,4}(?:\s*(?:BCE?|AD|CE))?)?\s*$",
@@ -45,13 +53,20 @@ _DATE_WORDS = {"january", "february", "march", "april", "may", "june",
                "ad", "ce", "or", "and", "st", "nd", "rd", "th", "fl"}
 
 
+_KEEP_PAREN_RE = re.compile(r"\b(?:warning|caution|note|danger|fatal|"
+                            r"toxic|deadly|poison\w*)\b", re.I)
+
+
 def _is_noise_paren(inner: str) -> bool:
     if not re.search(r"[A-Za-z0-9]", inner):
         return True                                   # "(; )" husks
+    if _KEEP_PAREN_RE.search(inner) or (
+            _QUALIFIER_RE.search(inner) and not _LANG_GLOSS_RE.match(inner)):
+        return False                                  # it changes the meaning
     if _PAREN_NOISE_RE.match(inner) or _PAREN_DATES_RE.match(inner):
         return True
     # language glosses and pronunciations: "(Icelandic: Ísland; ...)"
-    if (re.match(r"^\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\s*:", inner)
+    if (_LANG_GLOSS_RE.match(inner)
             or re.search(r"\bpronounced\b|\[[^\]]*[\u0250-\u02ff][^\]]*\]"
                          r"|/[^/\s][^/]*/", inner)):
         return True

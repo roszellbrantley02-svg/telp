@@ -158,3 +158,94 @@ def test_topical_but_wrong_facet_is_a_miss_on_every_path(telp):
         "talk to each other over a distance.", source="wikipedia:Telephone")
     reply = telp.respond("who invented the telephone?")
     assert "telecommunications device" not in reply
+
+
+# ─── from the code review ──────────────────────────────────────────
+
+def test_please_remember_a_fact_is_kept(telp):
+    telp.respond("please remember that my birthday is May 5")
+    assert "User's birthday is May 5." in telp.user_facts._texts
+
+
+@pytest.mark.parametrize("msg,fact", [
+    ("My name is Eric. Can you help me with my essay?",
+     "User's name is Eric."),
+    ("I work at Acme, could you write me a resignation letter",
+     "User works at Acme."),
+    ("I am a nurse, please explain triage", "User is a nurse."),
+])
+def test_fact_with_a_request_is_kept_and_the_request_answered(telp, msg,
+                                                              fact):
+    reply = telp.respond(msg)
+    assert fact in telp.user_facts._texts
+    assert not reply.startswith("Got it")
+
+
+@pytest.mark.parametrize("ask", [
+    "what are your sources?", "Really? How do you know that?",
+    "where did you learn that from?", "how do you know that's true?",
+    "can you cite your sources?",
+])
+def test_provenance_phrasings(telp, ask):
+    telp.respond("remember that the Zorblax river flows through Quendia")
+    telp.respond("where does the Zorblax river flow?")
+    telp.respond(ask)
+    assert _last(telp).get("domain") == "provenance"
+
+
+def test_vision_still_hears_ing_forms(telp):
+    telp.agent.lattice.add("Image: an image showing a cat on a sofa",
+                           source="image:/tmp/cat.png")
+    telp.respond("what have you been watching?")
+    assert _last(telp).get("domain") == "vision"
+
+
+def test_old_persona_lines_are_retired(fresh_state):
+    from mind.persona import PersonaStore
+    from mind.persona_seed import seed, RETIRED_PERSONA_TEXTS, PERSONA_FACTS
+    from lattice.semantic_encoder import SemanticEncoder
+    store = PersonaStore(encoder=SemanticEncoder())
+    store.add(RETIRED_PERSONA_TEXTS[3], trait="full", category="opinion")
+    store.add("I'm Telp.", category="identity")
+    seed(store)
+    assert not set(RETIRED_PERSONA_TEXTS) & set(store._texts)
+    assert {t for t, _, _ in PERSONA_FACTS} <= set(store._texts)
+
+
+def test_old_identity_seed_is_migrated(fresh_state):
+    from lattice.standalone_agent import StandaloneAgent
+    from mind.seed_identity import (seed_if_needed, IDENTITY_FACTS,
+                                    RETIRED_IDENTITY_FACTS)
+    agent = StandaloneAgent()
+    for fact in [IDENTITY_FACTS[0], RETIRED_IDENTITY_FACTS[0]]:
+        agent.lattice.add(fact, source="user_taught", tags="identity")
+    seed_if_needed(agent)
+    rows = dict(zip(agent.lattice._texts, agent.lattice._sources))
+    assert RETIRED_IDENTITY_FACTS[0] not in rows
+    assert set(IDENTITY_FACTS) <= set(rows)
+    assert {rows[f] for f in IDENTITY_FACTS} == {"identity"}
+
+
+@pytest.mark.parametrize("title,extract,head_ok", [
+    ("Python (programming language)",
+     "Python is a high-level programming language. It was created by "
+     "Guido van Rossum and first released in 1991.",
+     "Python is a high-level programming language."),
+    ("Émile Zola",
+     "Émile Zola was a French novelist and journalist. Zola was a "
+     "major figure in the political liberalization of France.",
+     "Émile Zola was a French novelist and journalist."),
+])
+def test_title_anchoring_on_tricky_titles(fresh_state, monkeypatch, title,
+                                          extract, head_ok):
+    import lattice.fetch_wiki as fw
+    from lattice.standalone_agent import StandaloneAgent
+    monkeypatch.setattr(fw, "fetch_full_lead",
+                        lambda t: {"title": title, "extract": extract})
+    agent = StandaloneAgent(skip_ngram_retrain=True)
+    REAL_GROWTH["learn_topic"](agent, title)
+    assert head_ok in agent.lattice._texts
+    # a forced re-fetch doesn't duplicate anything
+    n = agent.lattice.count()
+    REAL_GROWTH["learn_topic"](agent, title, force=True)
+    assert agent.lattice.count() == n

@@ -166,7 +166,10 @@ def _read_memories(db, sql: str, params: tuple = ()) -> list[tuple]:
     import sqlite3
     if not Path(db).exists():
         return []
-    con = sqlite3.connect(f"file:{Path(db).as_posix()}?mode=ro", uri=True)
+    try:
+        con = sqlite3.connect(str(db))   # exists: connect won't create it
+    except sqlite3.Error:
+        return []
     try:
         return con.execute(sql, params).fetchall()
     except sqlite3.OperationalError:

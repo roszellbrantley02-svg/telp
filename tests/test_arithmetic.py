@@ -45,3 +45,27 @@ def test_huge_powers_are_refused_not_hung(msg):
 def test_agent_arithmetic_still_works():
     r = detect_and_eval("what is 2 ** 10?")
     assert r is not None and r.value == 1024
+
+
+# ─── from the code review ──────────────────────────────────────────
+
+@pytest.mark.parametrize("msg", ["what is pow(9, 9**9)", "pow(10, 10**8)",
+                                 "pow(2, 3, 5)"])
+def test_pow_cannot_bypass_the_size_guard(msg):
+    assert try_code_synthesis(msg) is None
+
+
+@pytest.mark.parametrize("msg,expected", [
+    ("What’s 23 * 47?", "23 * 47 = 1081"),
+    ("can you calculate 4*4 for me", "4*4 = 16"),
+    ("what does 5 + 5 equal?", "5 + 5 = 10"),
+    ("what is 500-1000", "500-1000 = -500"),
+    ("what is -3 squared", "(-3)**2 = 9"),
+    ("what is pow(2, 10)", "pow(2, 10) = 1024"),
+])
+def test_more_phrasings_of_real_math(msg, expected):
+    assert try_code_synthesis(msg) == expected
+
+
+def test_hex_is_not_multiplication():
+    assert try_code_synthesis("0x10") is None

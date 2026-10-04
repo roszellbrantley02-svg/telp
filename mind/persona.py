@@ -213,6 +213,16 @@ class PersonaStore:
             self._plain = np.vstack([self._plain, plain[None, :]])
         return mid
 
+    def remove_texts(self, texts: list[str]) -> int:
+        """Delete persona facts by exact text (used to retire old lines)."""
+        n = 0
+        for t in texts:
+            n += self._con.execute(
+                "DELETE FROM persona_facts WHERE text=?", (t,)).rowcount
+        self._con.commit()
+        self._reload()
+        return n
+
     def add_many(self, items: list[dict]) -> None:
         """Bulk insert.  Items: [{text, trait?, category?, weight?}, ...]"""
         for item in items:

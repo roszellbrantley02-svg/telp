@@ -2015,13 +2015,17 @@ class FluentTelp:
     _STORY_STOP = re.compile(
         r"\s+(?:who|that|which|and|with|in|on|at|from|named|called|for)\b.*$",
         re.I)
+    _STORY_FILLER = re.compile(
+        r"(?:\s+(?:please|pls|now|today|tonight|again|ok|okay|thanks|"
+        r"thank\s+you|real\s+quick|quickly))+\s*[.!?]*$", re.I)
 
     @classmethod
     def _story_seed(cls, phrase: str | None) -> str | None:
         """'purple elephant who loves jam' -> 'elephant' (the head noun)."""
         if not phrase:
             return None
-        words = cls._STORY_STOP.sub("", phrase.strip()).split()
+        phrase = cls._STORY_FILLER.sub("", " " + phrase.strip())
+        words = cls._STORY_STOP.sub("", phrase).split()
         return words[-1].lower() if words else None
 
     def _story_route(self, user_msg: str, emotion) -> str | None:
@@ -2367,19 +2371,35 @@ class FluentTelp:
     # The WHOLE message must ask where the last answer came from. A
     # substring test sent "how do you know if an egg is bad" here.
     _PROV_RX = re.compile(
-        r"^\W*(?:(?:and|but|ok|okay|so|wait|hm+)[,\s]+)*(?:"
-        r"how\s+(?:do|did|would)\s+you\s+know(?:\s+(?:that|this|it|so|about\s+that))?"
-        r"|(?:where|how)\s+did\s+you\s+(?:learn|get|hear|read|find)\s+(?:that|this|it)"
-        r"|what(?:'s|\s+is|\s+was)\s+your\s+source(?:\s+for\s+(?:that|this|it))?"
-        r"|(?:cite|show\s+me|give\s+me)\s+your\s+sources?"
-        r"|your\s+sources?|sources?"
+        r"^\W*(?:(?:and|but|ok|okay|so|wait|really|hm+)[,.!?\s]+)*"
+        r"(?:(?:can|could|would)\s+you\s+(?:please\s+)?)?(?:"
+        r"how\s+(?:do|did|would|can)\s+you\s+know"
+        r"(?:\s+(?:that|this|it|so|about\s+that))?"
+        r"(?:(?:'s|\s+is|\s+was)\s+(?:true|right|correct|so))?"
+        r"|(?:where|how)\s+did\s+you\s+(?:learn|get|hear|read|find)"
+        r"\s+(?:that|this|it)(?:\s+from)?"
+        r"|what(?:'s|\s+is|\s+was|\s+are|\s+were)\s+(?:your|the|its)\s+"
+        r"sources?(?:\s+(?:for|on)\s+(?:that|this|it))?"
+        r"|(?:cite|show\s+me|give\s+me|tell\s+me|list)\s+(?:your|the)\s+"
+        r"sources?"
+        r"|(?:your|the)\s+sources?|sources?|citations?"
         r"|why\s+do\s+you\s+(?:say|think)\s+(?:that|this|so)"
-        r"|prove\s+it|where\s+did\s+that\s+come\s+from"
-        r")\W*$", re.I)
+        r"|prove\s+it|where\s+did\s+that\s+come\s+from|says\s+who"
+        r")(?:\s+please)?\W*$", re.I)
+
+    def _is_provenance_question(self, user_msg: str) -> bool:
+        """The whole message asks where the last answer came from - allowing
+        a short lead-in sentence ("Really? How do you know that?")."""
+        q = user_msg.lower().strip()
+        if self._PROV_RX.match(q):
+            return True
+        parts = re.split(r"(?<=[.!?])\s+", q)
+        return (len(parts) > 1 and len(" ".join(parts[:-1]).split()) <= 3
+                and bool(self._PROV_RX.match(parts[-1])))
 
     def _provenance_route(self, user_msg: str, emotion) -> str | None:
         q = user_msg.lower()
-        if not self._PROV_RX.match(q.strip()):
+        if not self._is_provenance_question(user_msg):
             return None
 
         def _say(body: str) -> str:
@@ -2441,7 +2461,8 @@ class FluentTelp:
         q = user_msg.lower()
         # whole words only: "photosynthesis" contains "photo", "seesaw"
         # contains "see" - neither is a question about Telp's sight
-        if not re.search(r"\b(?:" + "|".join(self._VISION_WORDS) + r")s?\b", q):
+        if not re.search(r"\b(?:" + "|".join(self._VISION_WORDS)
+                         + r")(?:s|es|ing|ed)?\b", q):
             return None
         # only questions about TELP's own seeing - "my video looks blurry"
         # is the user's problem, not a sight-memory query
@@ -2507,7 +2528,15 @@ class FluentTelp:
                 return shaped
             return None
         if content:
-            hits = recall_semantic(self.agent.lattice.db_path, " ".join(content), k=1)
+            try:
+                hits = recall_semantic(self.agent.lattice.db_path,
+                                       " ".join(content), k=1)
+            except Exception:
+                # no CLIP (torch missing / model unavailable): fall back to
+                # the captions' own words instead of crashing the reply
+                hits = [{**r, "similarity": 1.0} for r in reversed(rows)
+                        if any(w.lower() in r["caption"].lower()
+                               for w in content)][:1]
             # true matches score ~0.25+; sub-0.23 is the CLIP floor for unrelated
             if hits and hits[0]["similarity"] >= 0.23:
                 h = hits[0]
@@ -2911,8 +2940,11 @@ class FluentTelp:
                 if added:
                     print(f"[fluency] captured {len(added)} user-fact(s)",
                             flush=True)
-                    # acknowledge the teaching instead of hunting for an answer
-                    if not user_msg.rstrip().endswith("?"):
+                    # acknowledge the teaching instead of hunting for an
+                    # answer - unless the message also asked for something
+                    # ("I work at Acme, could you write me a letter")
+                    if not (user_msg.rstrip().endswith("?") or getattr(
+                            self.user_facts, "last_had_request", False)):
                         ack = "Got it - I'll remember that."
                         olds = getattr(self.user_facts,
                                        "last_superseded", [])

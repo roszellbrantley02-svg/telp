@@ -56,43 +56,65 @@ CREATE INDEX IF NOT EXISTS idx_source     ON memories(source);
 """
 
 
-def merge_legacy_memory(target: str | Path, legacy: str | Path) -> int:
+def merge_legacy_memory(target: str | Path, legacy: str | Path,
+                        encoder=None) -> int:
     """Fold a stray second memory file into the one memory.
 
     Before the single-memory fix, chat on a fresh install wrote to
     standalone_lattice.db until learn/see/watch created concept_bridge.db,
     after which everything taught earlier became invisible. This copies
     every row of `legacy` that `target` doesn't already hold (same text and
-    source), keeps original timestamps, then renames `legacy` to
-    *.db.merged so it runs once. Returns the number of rows recovered."""
+    source), keeping original timestamps. With an `encoder`, each row is
+    re-encoded so files written by an older encoder stay findable.
+
+    Runs once: a marker row in the target's telp_meta table records the
+    merge in the same transaction as the rows, so a failed rename (Windows,
+    an old daemon holding the file) can't make it re-run and resurrect rows
+    forgotten since. Returns the number of rows recovered."""
     target, legacy = Path(target), Path(legacy)
     if not legacy.exists() or (target.exists() and
                                target.resolve() == legacy.resolve()):
         return 0
+    key = f"merged:{legacy.name}"
     target.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(target), timeout=30.0)
     try:
-        con.executescript(_SCHEMA)
-        con.execute("ATTACH DATABASE ? AS old", (str(legacy),))
-        has_table = con.execute(
-            "SELECT 1 FROM old.sqlite_master WHERE type='table' "
-            "AND name='memories'").fetchone()
+        con.executescript(_SCHEMA + "CREATE TABLE IF NOT EXISTS telp_meta "
+                          "(key TEXT PRIMARY KEY, value TEXT);")
+        if con.execute("SELECT 1 FROM telp_meta WHERE key=?",
+                       (key,)).fetchone():
+            return 0
+        old = sqlite3.connect(str(legacy), timeout=30.0)
+        try:
+            has = old.execute("SELECT 1 FROM sqlite_master WHERE "
+                              "type='table' AND name='memories'").fetchone()
+            rows = old.execute(
+                "SELECT created_at, text, hv, metadata, source, tags "
+                "FROM memories ORDER BY id").fetchall() if has else []
+        finally:
+            old.close()
+        have = set(con.execute(
+            "SELECT text, IFNULL(source, '') FROM memories").fetchall())
         n = 0
-        if has_table:
-            cur = con.execute(
-                "INSERT INTO memories (created_at, text, hv, metadata, "
-                "source, tags) "
-                "SELECT o.created_at, o.text, o.hv, o.metadata, o.source, "
-                "o.tags FROM old.memories o WHERE NOT EXISTS ("
-                "  SELECT 1 FROM memories m WHERE m.text = o.text"
-                "  AND IFNULL(m.source, '') = IFNULL(o.source, ''))"
-                " ORDER BY o.id")
-            n = cur.rowcount
+        for created, text, hv, meta, source, tags in rows:
+            if (text, source or "") in have:
+                continue
+            if encoder is not None:
+                hv = encoder.encode(text).astype(np.int8).tobytes()
+            con.execute("INSERT INTO memories (created_at, text, hv, "
+                        "metadata, source, tags) VALUES (?, ?, ?, ?, ?, ?)",
+                        (created, text, hv, meta, source, tags))
+            have.add((text, source or ""))
+            n += 1
+        con.execute("INSERT INTO telp_meta (key, value) VALUES (?, ?)",
+                    (key, datetime.now(timezone.utc).isoformat()))
         con.commit()
-        con.execute("DETACH DATABASE old")
     finally:
         con.close()
-    legacy.rename(legacy.with_name(legacy.name + ".merged"))
+    try:                                  # cosmetic now - the marker rules
+        legacy.rename(legacy.with_name(legacy.name + ".merged"))
+    except OSError:
+        pass
     return n
 
 
@@ -162,7 +184,10 @@ class Lattice:
     def changed_on_disk(self) -> bool:
         """True when another process (or connection) has committed to the
         memory file since we last loaded it - teach/learn/forget run in
-        their own processes, so the resident daemon must notice."""
+        their own processes, so the resident daemon must notice. SQLite's
+        data_version ignores this connection's own commits, so it is only
+        re-read on reload (re-reading after our own writes would hide an
+        outside commit that landed just before them)."""
         return self._disk_version() != self._data_version
 
     def _append_rows(self, hvs: np.ndarray) -> None:
@@ -172,7 +197,8 @@ class Lattice:
         n_old = 0 if self._stack is None else self._stack.shape[0]
         n_new = n_old + hvs.shape[0]
         if self._buf is None or n_new > self._buf.shape[0]:
-            cap = max(n_new, 2 * (0 if self._buf is None else self._buf.shape[0]), 64)
+            # ~12% headroom: amortized O(1) appends without doubling RAM
+            cap = n_new + max(256, n_new // 8)
             buf = np.empty((cap, D), dtype=np.int8)
             if n_old:
                 buf[:n_old] = self._stack
@@ -257,7 +283,6 @@ class Lattice:
               source or None, tags or None)
         )
         self._con.commit()
-        self._data_version = self._disk_version()   # our own write
         mid = cur.lastrowid
         # Append to in-memory stack
         self._ids.append(mid)
@@ -307,7 +332,6 @@ class Lattice:
         except Exception:
             self._con.rollback()
             raise
-        self._data_version = self._disk_version()   # our own write
         # Update in-memory parallel structures in bulk
         new_texts = [t for t, _, _ in items]
         new_srcs  = [s or "" for _, _, s in items]

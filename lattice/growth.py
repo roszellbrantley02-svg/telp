@@ -64,18 +64,22 @@ def learn_topic(agent, topic: str, max_facts: int = 40, force: bool = False) -> 
     # the title's most distinctive word, matched as a WHOLE word: for "The
     # Beatles" the first word "the" is in every sentence, and "new" is
     # inside "news" - neither proves the sentence names its subject
-    _title_words = [w for w in re.findall(r"[a-z0-9]+", title.lower())
-                    if w not in _TITLE_STOP] or [title.split()[0].lower()]
+    # ("Python (programming language)" is about Python; "Émile Zola" must
+    # not split into "mile")
+    base = re.sub(r"\s*\([^)]*\)\s*$", "", title) or title
+    _title_words = [w for w in re.findall(r"\w+", base.lower())
+                    if w not in _TITLE_STOP] or [base.split()[0].lower()]
     head = max(_title_words, key=len)
     head_rx = re.compile(rf"\b{re.escape(head)}", re.I)
-    for s in sents[:max_facts]:
+    for raw in sents[:max_facts]:
+        s = raw
         # anchor coreference orphans AND any sentence that never names
         # its own article ("The seat of government is La Paz" must carry
         # "Bolivia:" or the capital question can never find it)
         if s.lower().startswith(_PRON) or not head_rx.search(s):
             s = f"{title}: {s}"
-        if s in existing:
-            continue                     # sentence-level dedup
+        if s in existing or raw in existing or f"{title}: {raw}" in existing:
+            continue                     # sentence-level dedup, any anchoring
         agent.lattice.add(s, source=f"wikipedia:{title}")
         try:                             # claims update inline, not just at boot
             agent.structured.add_sentence(s, source=f"wikipedia:{title}")

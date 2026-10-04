@@ -94,3 +94,54 @@ def test_daemon_notices_writes_from_other_processes(fresh_state):
     a._reload_from_disk()
     assert a._texts == ["second"]
     assert not a.changed_on_disk()
+
+
+def test_outside_commit_before_our_own_write_is_still_noticed(fresh_state):
+    from lattice.store import Lattice
+    from lattice.semantic_encoder import SemanticEncoder
+    enc = SemanticEncoder()
+    a = Lattice(fresh_state / "m.db", encoder=enc)
+    b = Lattice(fresh_state / "m.db", encoder=enc)
+    a.add("x", source="t")
+    b.add("taught elsewhere", source="t")
+    a.add("own", source="t")
+    assert a.changed_on_disk()
+
+
+def test_legacy_merge_runs_once_even_if_rename_fails(fresh_state):
+    import shutil
+    from lattice.store import Lattice, merge_legacy_memory
+    from lattice.semantic_encoder import SemanticEncoder
+    enc = SemanticEncoder()
+    legacy, target = fresh_state / "legacy.db", fresh_state / "main.db"
+    old = Lattice(legacy, encoder=enc)
+    old.add("Astro is the name of my dog.", source="user_taught")
+    old.close()
+    backup = fresh_state / "copy.db"
+    shutil.copy(legacy, backup)
+    assert merge_legacy_memory(target, legacy, encoder=enc) == 1
+    # the user forgets the fact; the legacy file reappears (failed rename)
+    main = Lattice(target, encoder=enc)
+    main.delete_ids(main._ids[:])
+    main.close()
+    shutil.copy(backup, legacy)
+    assert merge_legacy_memory(target, legacy, encoder=enc) == 0
+    assert Lattice(target, encoder=enc).count() == 0
+
+
+def test_legacy_merge_reencodes_old_vectors(fresh_state):
+    import sqlite3
+    from lattice.store import Lattice, merge_legacy_memory, _SCHEMA
+    from lattice.semantic_encoder import SemanticEncoder
+    enc = SemanticEncoder()
+    legacy, target = fresh_state / "legacy.db", fresh_state / "main.db"
+    con = sqlite3.connect(str(legacy))
+    con.executescript(_SCHEMA)
+    con.execute("INSERT INTO memories (created_at, text, hv, source) "
+                "VALUES ('2026-01-01', 'Astro is my dog.', ?, 'user_taught')",
+                (np.zeros(enc.dim, dtype=np.int8).tobytes(),))
+    con.commit()
+    con.close()
+    merge_legacy_memory(target, legacy, encoder=enc)
+    lat = Lattice(target, encoder=enc)
+    assert np.array_equal(lat._stack[0], enc.encode("Astro is my dog."))

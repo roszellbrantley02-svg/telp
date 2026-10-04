@@ -196,3 +196,20 @@ def test_words_in_the_request_are_not_list_data():
         "write a function to sort a list then reverse it") is None
     assert extract_literal_list("sort the list 5, 3, 9") == [5, 3, 9]
     assert extract_literal_list("sort the numbers 5 3 9") == [5, 3, 9]
+
+
+@pytest.mark.parametrize("raw,must_keep", [
+    ("Acetaminophen is a pain reliever (Warning: do not exceed 4 grams a "
+     "day) and is sold.", "do not exceed 4 grams"),
+    ("The cat food (Note: it is fatal to cats) was recalled.",
+     "fatal to cats"),
+    ("The bridge stood (from 1883 until it collapsed in 1890) over the "
+     "river.", "until it collapsed"),
+    ("The army (German forces withdrew) fell.", "German forces withdrew"),
+])
+def test_simplify_keeps_labelled_and_dated_asides(raw, must_keep):
+    assert must_keep in simplify(raw)
+
+
+def test_double_exclamation_still_reads_as_excited():
+    assert classify_emotion("it works!!") == "excited"

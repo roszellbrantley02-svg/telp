@@ -18,11 +18,21 @@ _RUNNER = ("import sys; sys.path.insert(0, sys.argv.pop(1)); "
            "runpy.run_path(sys.argv[0], run_name='__main__')")
 
 
+def _offline_env(state, port):
+    """Every proxy variable (urllib prefers the lowercase ones) points at a
+    dead local port, so learn-on-miss fails fast instead of going online."""
+    dead = "http://127.0.0.1:9"
+    env = dict(os.environ, TELP_STATE_DIR=str(state), TELP_PORT=str(port),
+               PYTHONDONTWRITEBYTECODE="1")
+    for k in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy",
+              "ALL_PROXY", "all_proxy"):
+        env[k] = dead
+    env["NO_PROXY"] = env["no_proxy"] = ""
+    return env
+
+
 def _telp(state, *args, port=None, timeout=120):
-    env = dict(os.environ, TELP_STATE_DIR=str(state),
-               PYTHONDONTWRITEBYTECODE="1",
-               TELP_PORT=str(port or _free_port()),
-               HTTPS_PROXY="http://127.0.0.1:9", HTTP_PROXY="http://127.0.0.1:9")
+    env = _offline_env(state, port or _free_port())
     return subprocess.run(
         [sys.executable, "-c", _RUNNER, str(ROOT), *args],
         cwd=ROOT, env=env, capture_output=True, text=True, timeout=timeout)
@@ -64,8 +74,7 @@ def test_arithmetic_and_honest_miss(tmp_path):
 
 def test_daemon_sees_what_other_processes_teach_and_forget(tmp_path):
     port = _free_port()
-    env = dict(os.environ, TELP_STATE_DIR=str(tmp_path), TELP_PORT=str(port),
-               PYTHONDONTWRITEBYTECODE="1")
+    env = _offline_env(tmp_path, port)
     daemon = subprocess.Popen(
         [sys.executable, "-c", _RUNNER, str(ROOT), "serve"], cwd=ROOT,
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)

@@ -52,6 +52,39 @@ IDENTITY_FACTS: list[str] = [
 ]
 
 
+# Facts earlier versions seeded - one machine-specific, one overclaiming.
+RETIRED_IDENTITY_FACTS = [
+    "Telp's source code is on E drive in the telp folder.",
+    "Telp's brain uses hyperdimensional computing.",
+]
+
+
+def _migrate_old_seed(agent) -> int:
+    """Bring a memory seeded by an earlier version up to date: drop retired
+    facts, add new ones, and relabel identity facts that were filed as
+    "user_taught" (provenance then told the user "you told me")."""
+    con = agent.lattice._con
+    relabeled = con.execute("UPDATE memories SET source='identity' "
+                            "WHERE tags='identity' AND source='user_taught'"
+                            ).rowcount
+    con.commit()
+    if relabeled:
+        agent.lattice._reload_from_disk()
+    retired = [mid for mid, t in zip(agent.lattice._ids, agent.lattice._texts)
+               if t in RETIRED_IDENTITY_FACTS]
+    agent.lattice.delete_ids(retired)        # also reloads from disk
+    have = set(agent.lattice._texts)
+    n = 0
+    for fact in IDENTITY_FACTS:
+        if fact not in have:
+            agent.lattice.add(fact, source="identity", tags="identity",
+                              turn=len(agent.turns))
+            n += 1
+    if relabeled or retired or n:
+        agent._rebuild_structured_qa()
+    return n
+
+
 # ─── Seed function ─────────────────────────────────────────────────
 
 
@@ -67,8 +100,9 @@ def seed(agent, force: bool = False) -> dict:
     already = agent.lattice._con.execute(
         "SELECT 1 FROM memories WHERE tags='identity' LIMIT 1").fetchone()
     if not force and already:
+        n_new = _migrate_old_seed(agent)
         return {"seeded": False, "reason": "already seeded",
-                  "marker": str(_MARKER)}
+                  "updated": n_new, "marker": str(_MARKER)}
 
     n_lattice = 0
     n_claims = 0

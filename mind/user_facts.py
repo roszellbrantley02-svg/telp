@@ -122,6 +122,16 @@ _REQUEST_RX = re.compile(
     r"\bi\s+have\s+(?:a\s+)?questions?\b")
 
 
+_CLAUSE_SPLIT_RX = re.compile(
+    r"(?<=[.!?;])\s+"
+    r"|,\s*(?=(?:and\s+|but\s+|so\s+)?(?:can|could|would|will|please|tell|"
+    r"show|give|help|explain|teach)\b)", re.I)
+
+
+def _clauses(msg: str) -> list[str]:
+    return [c for c in _CLAUSE_SPLIT_RX.split(msg) if c and c.strip()]
+
+
 def _clean_name(value: str) -> str:
     """'Eric and I'm a developer' -> 'Eric'; 'Mary Jane Watson' kept."""
     words = value.split()
@@ -212,6 +222,7 @@ class UserFactsStore:
             pass
         self._con.commit()
         self.last_superseded: list[str] = []
+        self.last_had_request = False
         self._ids: list[int] = []
         self._texts: list[str] = []
         self._stack: Optional[np.ndarray] = None
@@ -263,16 +274,24 @@ class UserFactsStore:
         # questions and hypotheticals are not facts about the user
         # ("if I have 3 apples and eat one, how many are left?")
         low = user_msg.strip().lower()
-        if low.endswith("?") or low.startswith(("if ", "what if", "suppose",
-                                                "imagine", "say ")):
+        if low.startswith(("if ", "what if", "suppose", "imagine", "say ",
+                           "forget", "don't remember", "do not remember")):
             return []
-        # commands and requests aren't facts either: "forget that I have
-        # two cats" must reach the forget route, "I have a question about
-        # Rome, can you help" must get answered
-        if low.startswith(("forget", "don't remember", "do not remember")) \
-                or _REQUEST_RX.search(low):
-            return []
-        facts = extract_user_facts(user_msg)
+        # Judge each clause on its own: "My name is Eric. Can you help me
+        # with my essay?" holds a fact AND a request. Questions and requests
+        # aren't facts ("I have a question about Rome"), but asking him to
+        # remember something is exactly how facts arrive.
+        facts = []
+        self.last_had_request = False
+        for clause in _clauses(user_msg):
+            c = clause.strip().lower()
+            if not c:
+                continue
+            if c.endswith("?") or (_REQUEST_RX.search(c)
+                                   and "remember" not in c):
+                self.last_had_request = True    # caller must still answer
+                continue
+            facts += extract_user_facts(clause)
         existing = set(self._texts)
         added = []
         self.last_superseded = []

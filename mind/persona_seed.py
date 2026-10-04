@@ -150,17 +150,48 @@ PERSONA_FACTS = [
 ]
 
 
+# Lines earlier versions seeded that weren't true of Telp (trading-era
+# leftovers, overclaims). Stores seeded with them get them swapped for the
+# current PERSONA_FACTS once - see _retire_old_lines.
+RETIRED_PERSONA_TEXTS = [
+    "I'm an AI, but I'm not an LLM. I run on hyperdimensional computing.",
+    "When the lattice doesn't have it the first way I ask, I'll rephrase "
+    "and try again.",
+    "I remember every conversation so the next answer sees what the last "
+    "one taught me.",
+    "I trust my Markov chain when it has full agreement and abstain "
+    "otherwise.",
+    "I refuse to learn from data that looks like calculation error. Bad "
+    "data poisons memory.",
+    "My take on AI: hyperdimensional computing handles a lot of what LLMs "
+    "do, but cheaper and more transparently.",
+    "A bad day isn't the end of the method. How much rides on one answer "
+    "matters more than being right every time.",
+]
+
+
+def _retire_old_lines(persona_store) -> int:
+    """Swap retired lines in an already-seeded store for the current ones.
+    Returns the number of current lines added."""
+    retired = [t for t in RETIRED_PERSONA_TEXTS if t in persona_store._texts]
+    if not retired:
+        return 0
+    persona_store.remove_texts(retired)
+    have = set(persona_store._texts)
+    items = [{"text": t, "trait": tr, "category": cat}
+             for (t, tr, cat) in PERSONA_FACTS if t not in have]
+    persona_store.add_many(items)
+    return len(items)
+
+
 def seed(persona_store) -> int:
     """Add all seed facts to the persona store.
 
-    Returns the number added.  Safe to call multiple times — it will
-    add duplicates only if you intentionally call it more than once
-    (we don't dedupe in the seed step; dedupe at the SQL level if you
-    want).
+    Returns the number added. On an already-seeded store it only retires
+    outdated lines (see RETIRED_PERSONA_TEXTS).
     """
     if persona_store.count() > 0:
-        # Already seeded; skip.
-        return 0
+        return _retire_old_lines(persona_store)
     items = [
         {"text": t, "trait": tr, "category": cat}
         for (t, tr, cat) in PERSONA_FACTS

@@ -213,12 +213,15 @@ _BUILD_APP_RX = re.compile(
 _STRONG_HEADS = {"app", "application", "cli", "tracker", "manager",
                  "journal", "database"}
 
-# "write a python script ..." names a LANGUAGE, not the app's entity
+# "write a python script ..." names a LANGUAGE, and "a simple todo app"
+# an adjective - neither is the app's entity, so both are peeled off
 _LANGUAGES = {"python", "py", "bash", "shell", "sh", "zsh", "powershell",
               "javascript", "js", "typescript", "ts", "node", "ruby", "perl",
               "php", "java", "kotlin", "go", "golang", "rust", "c", "cpp",
-              "c++", "csharp", "sql", "lua", "r", "swift", "small", "simple",
-              "quick", "basic", "little", "short", "new"}
+              "c++", "csharp", "sql", "lua", "r", "swift"}
+_MODIFIERS = {"simple", "quick", "small", "basic", "little", "short", "new",
+              "tiny", "cool", "nice", "good", "personal", "command-line",
+              "terminal", "my", "own"}
 
 
 # Aliases — phrases users say that map to a canonical entity name.
@@ -274,10 +277,12 @@ def detect_app_intent(msg: str) -> Optional[dict]:
     m = _BUILD_APP_RX.search(msg)
     if not m:
         return None
-    raw_entity = m.group(1).lower().strip()
     head = m.group(2).lower()
-    if raw_entity.split()[0] in _LANGUAGES:
+    words = [w for w in m.group(1).lower().split()
+             if w not in _LANGUAGES and w not in _MODIFIERS]
+    if not words:           # "a python script", "a simple app": no entity
         return None
+    raw_entity = " ".join(words)
     # Normalize: strip trailing "taking" / "tracking" filler
     raw_clean = re.sub(r"\s+(taking|tracking|management|keeping)$",
                               "", raw_entity)

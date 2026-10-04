@@ -818,7 +818,6 @@ def _safe_run(code: str, timeout: float = 5.0,
         script = Path(workdir) / "snippet.py"
         script.write_text(code, encoding="utf-8")
         env = {"PATH": os.environ.get("PATH", ""),
-               "PYTHONIOENCODING": "utf-8",
                "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")}  # Windows
         try:
             argv = ([sys.executable, "-I", "-W", "ignore", "-c",

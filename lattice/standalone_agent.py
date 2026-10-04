@@ -95,7 +95,8 @@ class StandaloneAgent:
         if Path(lattice_path) == MEMORY_DB:
             from lattice.store import merge_legacy_memory
             try:
-                n_rec = merge_legacy_memory(MEMORY_DB, LEGACY_MEMORY_DB)
+                n_rec = merge_legacy_memory(MEMORY_DB, LEGACY_MEMORY_DB,
+                                            encoder=self.encoder)
                 if n_rec:
                     print(f"[standalone] recovered {n_rec} memories from "
                           f"{LEGACY_MEMORY_DB.name}")
@@ -213,8 +214,10 @@ class StandaloneAgent:
     # url: added 2026-07-02 (URL-learned facts were invisible to claims);
     # code: added for ingest_self self-code claims (previously vanished
     # every restart despite CodeQA sitting in the live answer chain)
+    # youtube: (transcripts) added so YouTube-learned claims survive a
+    # restart; video:/image: rows are perception logs, not claims
     _CORPUS_PREFIXES = ("wikipedia:", "user_taught", "identity", "wisdom:",
-                        "legacy:", "url:", "code:", "youtube:", "video:")
+                        "legacy:", "url:", "code:", "youtube:")
 
     def _corpus_sentences(self) -> list[str]:
         return [t for t, s in zip(self.lattice._texts, self.lattice._sources)

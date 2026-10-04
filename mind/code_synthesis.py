@@ -36,6 +36,9 @@ _NL_REPLACEMENTS = [
     (re.compile(r"\bdivided\s+by\b", re.IGNORECASE), "/"),
     (re.compile(r"\bover\b", re.IGNORECASE),         "/"),
     (re.compile(r"\bmod(?:ulo)?\b", re.IGNORECASE),  "%"),
+    # a negative base keeps its sign: "-3 squared" is 9, not -(3**2)
+    (re.compile(r"(-\d+(?:\.\d+)?)\s*squared\b", re.IGNORECASE), r"(\1)**2"),
+    (re.compile(r"(-\d+(?:\.\d+)?)\s*cubed\b", re.IGNORECASE), r"(\1)**3"),
     (re.compile(r"\bsquared\b", re.IGNORECASE),      "**2"),
     (re.compile(r"\bcubed\b", re.IGNORECASE),        "**3"),
     (re.compile(r"\bto\s+the\s+power\s+of\b", re.IGNORECASE), "**"),
@@ -43,6 +46,11 @@ _NL_REPLACEMENTS = [
     (re.compile(r"\bpercent\s+of\b", re.IGNORECASE), "* 0.01 *"),
     (re.compile(r"%\s+of\b", re.IGNORECASE),         "* 0.01 *"),
 ]
+
+
+def _safe_pow(base, exp):
+    from lattice.arithmetic_qa import safe_pow
+    return safe_pow(base, exp)
 
 
 # Allow-listed function names (must be lowercase)
@@ -53,7 +61,7 @@ _SAFE_FUNCS = {
     "max": max,
     "sum": sum,
     "len": len,
-    "pow": pow,
+    "pow": lambda base, exp: _safe_pow(base, exp),   # 2 args, size-capped
     "sqrt": math.sqrt,
     "log": math.log,
     "log10": math.log10,
@@ -103,20 +111,22 @@ def _is_safe(tree: ast.AST) -> bool:
 _LEAD_RX = re.compile(
     r"^\s*(?:(?:hey|ok|okay|so|please|telp)[,!\s]+)*"
     r"(?:(?:can|could)\s+you\s+(?:please\s+)?)?"
-    r"(?:what(?:'s|\s+is|s)|how\s+much\s+is|calculate|compute|evaluate"
-    r"|solve|work\s+out|tell\s+me)?\s*",
+    r"(?:what(?:'s|\s+is|s|\s+does|\s+do)|how\s+much\s+is|calculate"
+    r"|compute|evaluate|solve|work\s+out|tell\s+me)?\s*",
     re.IGNORECASE,
 )
-_TRAIL_RX = re.compile(r"\s*(?:=|\bequals?\b|\bplease\b)?\s*[?.!]*\s*$",
-                       re.IGNORECASE)
+_TRAIL_RX = re.compile(r"(?:\s*(?:=|\bequals?\b|\bplease\b|\bfor\s+me\b))*"
+                       r"\s*[?.!]*\s*$", re.IGNORECASE)
+# a phone number needs no rule of its own: "call 555-1234" already fails
+# the whole-message test, and bare "500-1000" is subtraction
 _DATE_PHONE_RX = re.compile(
     r"\b\d{4}-\d{1,2}-\d{1,2}\b"        # 2024-10-15
     r"|\b\d{1,2}/\d{1,2}/\d{2,4}\b"     # 10/15/2024
-    r"|\b\d{3}-\d{4}\b"                  # 555-1234
 )
 _SQRT_RX = re.compile(r"\b(?:the\s+)?square\s+root\s+of\s+(\d+(?:\.\d+)?)",
                       re.IGNORECASE)
-_TIMES_X_RX = re.compile(r"(?<=\d)\s*[x\u00d7]\s*(?=\d)", re.IGNORECASE)
+# "3 x 4", "3x4", "10x10" - but not hex "0x10"
+_TIMES_X_RX = re.compile(r"(?<=\d)(?<!\b0)\s*[x\u00d7]\s*(?=\d)", re.IGNORECASE)
 _WORD_RX = re.compile(r"[a-z_]+", re.IGNORECASE)
 _OP_RX = re.compile(r"[-+*/%]|\b[a-z]+\s*\(", re.IGNORECASE)
 
@@ -124,6 +134,7 @@ _OP_RX = re.compile(r"[-+*/%]|\b[a-z]+\s*\(", re.IGNORECASE)
 def _extract_expression(msg: str) -> Optional[str]:
     """The message as a pure arithmetic expression, or None when it is
     anything else (a date, a phone number, a sentence with numbers)."""
+    msg = msg.replace("\u2019", "'")         # curly apostrophe (phones)
     if _DATE_PHONE_RX.search(msg):
         return None
     s = _SQRT_RX.sub(r"sqrt(\1)", msg)

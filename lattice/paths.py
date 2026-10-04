@@ -17,7 +17,8 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-STATE_DIR = Path(os.environ.get("TELP_STATE_DIR") or ROOT / "state")
+STATE_DIR = Path(os.environ.get("TELP_STATE_DIR")
+                 or ROOT / "state").expanduser().resolve()
 
 MEMORY_DB = STATE_DIR / "concept_bridge.db"
 LEGACY_MEMORY_DB = STATE_DIR / "standalone_lattice.db"

@@ -66,3 +66,21 @@ def test_story_topic(msg, seed):
 def test_story_without_topic_has_no_seed():
     m = FluentTelp._STORY_RE.search("tell me a story")
     assert m and FluentTelp._story_seed(m.group(1)) is None
+
+
+@pytest.mark.parametrize("msg,entity", [
+    ("build me a simple todo app", "todo"),
+    ("create a small habit tracker", "habit"),
+    ("build a new contact manager", "contact"),
+    ("build me a python todo app", "todo"),
+])
+def test_adjectives_and_languages_are_peeled_off_app_names(msg, entity):
+    assert detect_app_intent(msg)["entity"] == entity
+
+
+@pytest.mark.parametrize("phrase,seed", [
+    ("dragon please", "dragon"), ("dogs tonight", "dogs"),
+    ("cat now", "cat"), ("lonely whale ok", "whale"),
+])
+def test_story_seed_ignores_trailing_filler(phrase, seed):
+    assert FluentTelp._story_seed(phrase) == seed

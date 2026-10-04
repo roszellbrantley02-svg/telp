@@ -136,10 +136,20 @@ _KEYWORD_BOOSTS = {
     "urgent":     {"asap", "hurry", "tldr", "tl;dr", "short version",
                        "quick question", "right now"},
 }
+def _keyword_pattern(w: str) -> str:
+    """Word guards only on alphanumeric ends: "it works!!" must still
+    count, "known" must not contain "now"."""
+    p = re.escape(w)
+    if w[:1].isalnum():
+        p = r"(?<![\w'])" + p
+    if w[-1:].isalnum():
+        p = p + r"(?![\w'])"
+    return p
+
+
 _KEYWORD_RX = {
-    emo: re.compile(r"(?<![\w'])(?:" + "|".join(
-        re.escape(w) for w in sorted(words, key=len, reverse=True))
-        + r")(?![\w'])", re.I)
+    emo: re.compile("|".join(_keyword_pattern(w) for w in
+                             sorted(words, key=len, reverse=True)), re.I)
     for emo, words in _KEYWORD_BOOSTS.items()
 }
 
