@@ -14,5 +14,8 @@ openai-whisper          # ears: hear videos without captions
 easyocr                 # reading eyes: text inside frames
 yt-dlp                  # watch YouTube videos (download)
 youtube-transcript-api  # read YouTube captions
+nltk                    # phonetics for the dictionary/imagination lane
+
+# Tests: pip install -r requirements-dev.txt && python -m pytest
 
 # ffmpeg must be on PATH (or set TELP_FFMPEG_DIR) for video watching/hearing.
