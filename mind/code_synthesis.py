@@ -69,7 +69,7 @@ _SAFE_FUNCS = {
 
 
 _ALLOWED_NODES = {
-    ast.Expression, ast.Constant, ast.Num,
+    ast.Expression, ast.Constant,
     ast.BinOp, ast.UnaryOp, ast.BoolOp,
     ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow,
     ast.USub, ast.UAdd, ast.Invert,
@@ -95,29 +95,95 @@ def _is_safe(tree: ast.AST) -> bool:
     return True
 
 
-_ARITH_EXPR_RX = re.compile(
-    r"[-+]?\s*\d+(?:\.\d+)?(?:\s*[+\-*/%^()]\s*[-+]?\s*\d+(?:\.\d+)?)+",
+# A math request is the WHOLE message (minus a polite lead-in like
+# "what is" and a trailing "?") being an expression. Searching for any
+# digits-operator-digits span anywhere answered "meeting on 2024-10-15"
+# with "= 1999", "call 555-1234" with "-679" and "who won 3-2?" with "1",
+# and cut "2*(3+4)" down to "3+4".
+_LEAD_RX = re.compile(
+    r"^\s*(?:(?:hey|ok|okay|so|please|telp)[,!\s]+)*"
+    r"(?:(?:can|could)\s+you\s+(?:please\s+)?)?"
+    r"(?:what(?:'s|\s+is|s)|how\s+much\s+is|calculate|compute|evaluate"
+    r"|solve|work\s+out|tell\s+me)?\s*",
+    re.IGNORECASE,
 )
+_TRAIL_RX = re.compile(r"\s*(?:=|\bequals?\b|\bplease\b)?\s*[?.!]*\s*$",
+                       re.IGNORECASE)
+_DATE_PHONE_RX = re.compile(
+    r"\b\d{4}-\d{1,2}-\d{1,2}\b"        # 2024-10-15
+    r"|\b\d{1,2}/\d{1,2}/\d{2,4}\b"     # 10/15/2024
+    r"|\b\d{3}-\d{4}\b"                  # 555-1234
+)
+_SQRT_RX = re.compile(r"\b(?:the\s+)?square\s+root\s+of\s+(\d+(?:\.\d+)?)",
+                      re.IGNORECASE)
+_TIMES_X_RX = re.compile(r"(?<=\d)\s*[x\u00d7]\s*(?=\d)", re.IGNORECASE)
+_WORD_RX = re.compile(r"[a-z_]+", re.IGNORECASE)
+_OP_RX = re.compile(r"[-+*/%]|\b[a-z]+\s*\(", re.IGNORECASE)
 
 
 def _extract_expression(msg: str) -> Optional[str]:
-    """Find a math expression in the message after NL replacements.
-    Returns the expression text or None.
-    """
-    s = msg
+    """The message as a pure arithmetic expression, or None when it is
+    anything else (a date, a phone number, a sentence with numbers)."""
+    if _DATE_PHONE_RX.search(msg):
+        return None
+    s = _SQRT_RX.sub(r"sqrt(\1)", msg)
     for pat, repl in _NL_REPLACEMENTS:
         s = pat.sub(repl, s)
-    # Replace ^ with **
-    s = s.replace("^", "**")
-    # Strip question marks / trailing punctuation
-    s = s.rstrip("?.! ")
-    # Find a span that looks like an arithmetic expression
-    m = _ARITH_EXPR_RX.search(s)
-    if not m:
-        # no last-resort letter-stripping: "serial ZX-99" is not "-99".
-        # A real expression needs two operands (the regex above).
+    s = _TIMES_X_RX.sub(" * ", s)
+    s = re.sub(r"\s*(?:\^|\*\*)\s*", "**", s)
+    s = _TRAIL_RX.sub("", _LEAD_RX.sub("", s, count=1)).strip()
+    if not s or not re.search(r"\d", s) or not _OP_RX.search(s):
         return None
-    return m.group(0).strip()
+    # every word left must be an allow-listed function or constant
+    if any(w.lower() not in _SAFE_FUNCS for w in _WORD_RX.findall(s)):
+        return None
+    return s
+
+
+def _eval_node(node):
+    """Walk the (already allow-listed) AST. ** goes through safe_pow so
+    9**9**9 is refused instead of hanging the resident daemon."""
+    from lattice.arithmetic_qa import safe_pow
+    if isinstance(node, ast.Expression):
+        return _eval_node(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.Name):
+        v = _SAFE_FUNCS[node.id]
+        if callable(v):
+            raise ValueError(f"{node.id} needs arguments")
+        return v
+    if isinstance(node, ast.UnaryOp):
+        v = _eval_node(node.operand)
+        if isinstance(node.op, ast.USub):
+            return -v
+        if isinstance(node.op, ast.UAdd):
+            return +v
+        raise ValueError("unsupported unary operator")
+    if isinstance(node, ast.BinOp):
+        a, b = _eval_node(node.left), _eval_node(node.right)
+        op = type(node.op)
+        if op is ast.Add:
+            return a + b
+        if op is ast.Sub:
+            return a - b
+        if op is ast.Mult:
+            return a * b
+        if op is ast.Div:
+            return a / b
+        if op is ast.FloorDiv:
+            return a // b
+        if op is ast.Mod:
+            return a % b
+        if op is ast.Pow:
+            return safe_pow(a, b)
+        raise ValueError("unsupported operator")
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        f = _SAFE_FUNCS[node.func.id]
+        if not callable(f):
+            raise ValueError(f"{node.func.id} is not a function")
+        return f(*[_eval_node(a) for a in node.args])
+    raise ValueError(f"unsupported expression: {type(node).__name__}")
 
 
 def _format_result(value) -> str:
@@ -132,9 +198,9 @@ def _format_result(value) -> str:
 
 
 def try_arithmetic(msg: str) -> Optional[str]:
-    """If the message looks like a math question, evaluate and return
-    a formatted answer string.  Returns None when it's not math or
-    the expression is unsafe / unparseable.
+    """If the message IS a math question, evaluate and return a formatted
+    answer string. Returns None when it's not math or the expression is
+    unsafe / unparseable / too large.
     """
     if not msg:
         return None
@@ -148,13 +214,12 @@ def try_arithmetic(msg: str) -> Optional[str]:
     if not _is_safe(tree):
         return None
     try:
-        result = eval(compile(tree, "<arith>", "eval"),
-                       {"__builtins__": {}}, dict(_SAFE_FUNCS))
+        result = _eval_node(tree)
+        if isinstance(result, bool) or not isinstance(result, (int, float)):
+            return None
+        return f"{expr} = {_format_result(result)}"
     except Exception:
         return None
-    if not isinstance(result, (int, float, bool)):
-        return None
-    return f"{expr.strip()} = {_format_result(result)}"
 
 
 # ─── Layer 2 — live data queries (stub) ──────────────────────────
@@ -189,7 +254,8 @@ def try_live_data(msg: str) -> Optional[str]:
     try:
         import sqlite3
         from pathlib import Path
-        bars = Path(__file__).resolve().parents[1] / "state" / "bars.db"
+        from lattice.paths import state_path
+        bars = state_path("bars.db")
         if not bars.exists():
             return None
         con = sqlite3.connect(str(bars))

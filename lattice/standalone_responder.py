@@ -215,12 +215,9 @@ class TemplateResponder:
                           f"nothing close enough to be reliable: \"{text}\"")
             return text
 
-        # 3. Pure HDC generation seeded by the question's content words.
-        generated = self._try_generate(query)
-        if generated:
-            return generated
-
-        # 4. Nothing.
+        # 3. Nothing. (This used to fall through to n-gram generation
+        # seeded by the question's own words - with an empty memory that
+        # just echoed the question back. Say so honestly instead.)
         return ("I don't have any memories or facts about that yet. "
                   "Teach me by talking, or use /learn <topic> to ingest "
                   "a Wikipedia article.")

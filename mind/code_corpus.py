@@ -37,7 +37,8 @@ import numpy as np
 _TELP_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_TELP_ROOT))
 
-CODE_CORPUS_DB = _TELP_ROOT / "state" / "code_corpus.db"
+from lattice.paths import state_path  # noqa: E402
+CODE_CORPUS_DB = state_path("code_corpus.db")
 
 
 _SCHEMA = """

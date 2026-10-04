@@ -119,18 +119,28 @@ def get_anchors(encoder) -> dict[str, np.ndarray]:
 
 # Lightweight keyword priors — boost an emotion when a strong signal
 # word appears, in case the HDC encoder isn't catching it.
+# Whole words or phrases only - substring tests read "known" as "now"
+# (urgent), "the Great Wall" as excitement and "explain photosynthesis" as
+# confusion. Words that are ordinary inside questions ("fast", "stop",
+# "fail", "great", "explain") are left out.
 _KEYWORD_BOOSTS = {
-    "frustrated": {"ugh", "wtf", "damn", "fuck", "broken",
-                       "stuck", "fail", "failing", "frustrat",
-                       "annoyed", "annoying", "stop", "ridiculous"},
-    "excited":    {"awesome", "amazing", "incredible", "perfect",
-                       "yes!", "let's go", "fantastic", "love it",
-                       "great", "!!", "wow"},
-    "confused":   {"huh", "wait", "what?", "what.", "what,",
-                       "don't understand", "confused", "lost",
-                       "clarify", "explain"},
-    "urgent":     {"asap", "hurry", "quick", "fast", "now",
-                       "tldr", "brief", "short version"},
+    "frustrated": {"ugh", "wtf", "damn", "fuck", "frustrated",
+                       "frustrating", "annoyed", "annoying", "ridiculous",
+                       "this is broken", "still broken", "i'm stuck",
+                       "im stuck", "doesn't work", "not working"},
+    "excited":    {"awesome", "amazing", "incredible", "fantastic",
+                       "let's go", "love it", "wow", "yes!", "!!"},
+    "confused":   {"huh", "don't understand", "dont understand",
+                       "confused", "i'm lost", "im lost", "makes no sense",
+                       "what do you mean"},
+    "urgent":     {"asap", "hurry", "tldr", "tl;dr", "short version",
+                       "quick question", "right now"},
+}
+_KEYWORD_RX = {
+    emo: re.compile(r"(?<![\w'])(?:" + "|".join(
+        re.escape(w) for w in sorted(words, key=len, reverse=True))
+        + r")(?![\w'])", re.I)
+    for emo, words in _KEYWORD_BOOSTS.items()
 }
 
 
@@ -152,8 +162,8 @@ def classify_emotion(msg: str, encoder=None,
 
     # ── Keyword fast-path ──
     keyword_hits: dict[str, int] = {}
-    for emotion, words in _KEYWORD_BOOSTS.items():
-        hits = sum(1 for w in words if w in low)
+    for emotion, rx in _KEYWORD_RX.items():
+        hits = len(rx.findall(low))
         if hits:
             keyword_hits[emotion] = hits
     if keyword_hits:

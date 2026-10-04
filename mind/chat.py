@@ -193,9 +193,16 @@ def _main() -> None:
             t = telp.agent.turns[-1]
             mems = t.get("retrieved_memories") or []
             if mems:
+                # routes record either retrieval dicts or plain memory texts
                 top = mems[0]
-                print(f"      (top retrieval: sim={top.get('similarity',0):.2f} "
-                        f"src={top.get('source','?')})")
+                if isinstance(top, dict):
+                    print(f"      (top retrieval: "
+                          f"sim={top.get('similarity', 0):.2f} "
+                          f"src={top.get('source', '?')})")
+                else:
+                    print(f"      (top memory: {str(top)[:80]!r}  "
+                          f"sim={t.get('similarity', 0):.2f}  "
+                          f"route={t.get('domain', '?')})")
             if t.get("extracted_triples"):
                 print(f"      (claims extracted: {t['extracted_triples']})")
             if t.get("kg_hits"):

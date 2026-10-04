@@ -50,8 +50,9 @@ if str(_TELP_ROOT) not in sys.path:
 # ─── Storage layout ───────────────────────────────────────────────
 
 
-DEFAULT_RAW   = _TELP_ROOT / "state" / "wiktionary" / "raw.jsonl"
-DEFAULT_DB    = _TELP_ROOT / "state" / "wiktionary" / "dict.db"
+from lattice.paths import state_path  # noqa: E402
+DEFAULT_RAW   = state_path("wiktionary", "raw.jsonl")
+DEFAULT_DB    = state_path("wiktionary", "dict.db")
 
 
 SCHEMA = """

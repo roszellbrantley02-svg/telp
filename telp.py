@@ -84,18 +84,20 @@ def cmd_serve(_args) -> int:
                 if req.get("op") == "quit":
                     conn.sendall(b'{"reply": "Telp going to sleep."}\n')
                     break
-                # another process may have taught/learned/forgotten - resync
+                # another process may have taught/learned/forgotten - resync.
+                # SQLite's data_version catches every outside commit (a
+                # row-count check missed "forget 5, learn 5").
                 lat = t.agent.lattice
                 try:
-                    n_db = lat._con.execute(
-                        "SELECT COUNT(*) FROM memories").fetchone()[0]
-                    if n_db != len(lat._ids):
-                        print(f"[serve] memory changed on disk "
-                              f"({len(lat._ids)} -> {n_db}) - resyncing",
-                              flush=True)
+                    if lat.changed_on_disk():
+                        n_old = len(lat._ids)
                         lat._reload_from_disk()
-                except Exception:
-                    pass
+                        t.agent._rebuild_structured_qa()
+                        print(f"[serve] memory changed on disk "
+                              f"({n_old} -> {len(lat._ids)}) - resynced",
+                              flush=True)
+                except Exception as e:
+                    print(f"[serve] resync failed: {e}", flush=True)
                 reply = t.respond(req.get("text", ""),
                                   creativity=float(req.get("creativity", 0.30)))
                 conn.sendall((json.dumps({"reply": reply}) + "\n").encode("utf-8"))

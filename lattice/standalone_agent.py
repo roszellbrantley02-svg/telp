@@ -54,7 +54,11 @@ except ImportError:
     _IMAGES_AVAILABLE = False
 
 
-DEFAULT_LATTICE_DB = _TELP_ROOT / "state" / "standalone_lattice.db"
+from lattice.paths import MEMORY_DB, LEGACY_MEMORY_DB, state_path
+
+# The one memory: every command (chat, ask, teach, learn, see, watch,
+# forget) opens this same file - see lattice/paths.py.
+DEFAULT_LATTICE_DB = MEMORY_DB
 
 
 class StandaloneAgent:
@@ -87,10 +91,23 @@ class StandaloneAgent:
         if self.encoder is None:
             print("[standalone] building corpus-trained RI encoder ...")
             self.encoder = CorpusRIEncoder()
+        # Recover memories orphaned in the pre-fix second memory file
+        if Path(lattice_path) == MEMORY_DB:
+            from lattice.store import merge_legacy_memory
+            try:
+                n_rec = merge_legacy_memory(MEMORY_DB, LEGACY_MEMORY_DB)
+                if n_rec:
+                    print(f"[standalone] recovered {n_rec} memories from "
+                          f"{LEGACY_MEMORY_DB.name}")
+            except Exception as e:
+                print(f"[standalone] could not merge "
+                      f"{LEGACY_MEMORY_DB.name}: {e}")
         # auto-GPU: mirror the memory stack on cuda once it's big enough
         # to matter (the educated lattice) - one env var, set by default
         try:
             import sqlite3 as _sq
+            if not Path(lattice_path).exists():
+                raise FileNotFoundError(lattice_path)
             _n = _sq.connect(str(lattice_path)).execute(
                 "SELECT COUNT(*) FROM memories").fetchone()[0]
             if _n > 15000:
@@ -155,6 +172,15 @@ class StandaloneAgent:
             n_claims = self._rebuild_structured_qa()
             print(f"[standalone] structured-QA: {n_claims} claims")
 
+    def _known_vocab(self) -> dict:
+        """Words this mind has seen. The semantic encoder never fills
+        index_vectors (it embeds whole sentences), so reading that made
+        EVERY word "unknown": fallback confidence was always capped and
+        typo correction rewrote real words ("Back pain" -> "Bach pain").
+        Its corpus statistics (doc_freq) are the real vocabulary."""
+        df = getattr(self.encoder, "doc_freq", None)
+        return df if df else self.encoder.index_vectors
+
     def ensure_generator(self):
         """Train the n-gram generator on demand (first creative request).
         HONEST SCALING NOTE (2026-07-03): trained on the full educated lattice
@@ -187,8 +213,8 @@ class StandaloneAgent:
     # url: added 2026-07-02 (URL-learned facts were invisible to claims);
     # code: added for ingest_self self-code claims (previously vanished
     # every restart despite CodeQA sitting in the live answer chain)
-    _CORPUS_PREFIXES = ("wikipedia:", "user_taught", "wisdom:", "legacy:",
-                        "url:", "code:")
+    _CORPUS_PREFIXES = ("wikipedia:", "user_taught", "identity", "wisdom:",
+                        "legacy:", "url:", "code:", "youtube:", "video:")
 
     def _corpus_sentences(self) -> list[str]:
         return [t for t, s in zip(self.lattice._texts, self.lattice._sources)
@@ -226,7 +252,7 @@ class StandaloneAgent:
         try:
             import json as _json
             from pathlib import Path as _Path
-            dates_path = _TELP_ROOT / "state" / "wikidata_dates.json"
+            dates_path = state_path("wikidata_dates.json")
             if dates_path.exists():
                 cache = _json.loads(dates_path.read_text(encoding="utf-8"))
                 n_date = 0
@@ -259,6 +285,7 @@ class StandaloneAgent:
         self.aggregate = AggregateQA(self.structured)
         self.analogy = AnalogyQA(self.lattice, self.structured)
         self.compare = CompareQA(self.structured)
+        self.code_qa = CodeQA(self.lattice, self.structured)
         return n
 
     def _rebuild_kg_from_corpus(self) -> tuple[int, int]:
@@ -561,7 +588,7 @@ class StandaloneAgent:
                 continue
             # Don't correct common content words that happen to be
             # capitalised (sentence-initial "Tell", question words, etc).
-            if low in self.encoder.index_vectors and low not in candidates:
+            if low in self._known_vocab() and low not in candidates:
                 # In our vocab as a non-entity word - don't replace it.
                 continue
             # Find unique closest candidate within edit distance 2.
@@ -959,7 +986,7 @@ class StandaloneAgent:
         # 0. Snapshot the encoder vocab BEFORE we add the new sentence
         #    — needed by the confidence calibrator to detect query
         #    tokens we haven't seen before.
-        self._vocab_before_turn = frozenset(self.encoder.index_vectors.keys())
+        self._vocab_before_turn = frozenset(self._known_vocab().keys())
         # Update the encoder so the new sentence's vocabulary is known.
         self.encoder.add_sentence(user_msg)
 
@@ -1159,7 +1186,8 @@ class StandaloneAgent:
         raw = self.lattice.query(user_msg, k=60, threshold=0.49)
         raw = [m for m in raw
                 if not str(m.get("source", "")).startswith(
-                    ("agent_response", "conversation_turn", "user_msg"))]
+                    ("agent_response", "conversation_turn", "user_msg",
+                     "story:"))]
 
         q_words = self._content_words(user_msg)
 
@@ -1291,9 +1319,13 @@ class StandaloneAgent:
                 # discriminator is "trends" (or its stem); a candidate
                 # that doesn't contain "trends" or "trend" anywhere is
                 # off-topic regardless of how it looks in HV space.
-                if not hasattr(self, "_disc_cache"):
+                if (not hasattr(self, "_disc_cache")
+                        or len(self._disc_cache) > 512):
                     self._disc_cache = {}
-                cache_key = id(q_words)
+                # keyed by the words themselves: id() of a per-turn set
+                # is reused once the set is freed, so a later question
+                # could be ranked with an earlier question's key words
+                cache_key = frozenset(q_words)
                 if cache_key not in self._disc_cache:
                     ranked = sorted(
                         ((self.encoder._idf_weight(w), w) for w in q_words),
@@ -1439,7 +1471,7 @@ class StandaloneAgent:
         # query's tokens).  Otherwise "blockchain" looks "known"
         # because the encoder just learned it from this very query.
         vocab = getattr(self, "_vocab_before_turn",
-                          frozenset(self.encoder.index_vectors.keys()))
+                          frozenset(self._known_vocab().keys()))
         unknown_content = [
             w for w in q_content
             if len(w) >= 4

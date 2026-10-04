@@ -18,7 +18,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _TELP_ROOT = Path(__file__).resolve().parents[1]
-OUT_FILE = _TELP_ROOT / "state" / "wiki_corpus.json"
+if str(_TELP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TELP_ROOT))
+from lattice.paths import state_path  # noqa: E402
+OUT_FILE = state_path("wiki_corpus.json")
 
 
 # Curated 100+ topic list across diverse categories

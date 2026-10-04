@@ -19,6 +19,8 @@ from pathlib import Path
 _TELP_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_TELP_ROOT))
 
+_TITLE_STOP = {"the", "a", "an", "of", "and", "in", "on", "for", "to", "at",
+               "by", "with", "from", "de", "la", "le", "el"}
 _PRON = ("it ", "its ", "they ", "their ", "he ", "she ", "his ", "her ",
          "this ", "these ", "the species ", "the animal ")
 
@@ -59,12 +61,18 @@ def learn_topic(agent, topic: str, max_facts: int = 40, force: bool = False) -> 
     sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", r["extract"])
              if len(s.strip()) > 30]
     n = 0
-    head = title.split()[0].lower()
+    # the title's most distinctive word, matched as a WHOLE word: for "The
+    # Beatles" the first word "the" is in every sentence, and "new" is
+    # inside "news" - neither proves the sentence names its subject
+    _title_words = [w for w in re.findall(r"[a-z0-9]+", title.lower())
+                    if w not in _TITLE_STOP] or [title.split()[0].lower()]
+    head = max(_title_words, key=len)
+    head_rx = re.compile(rf"\b{re.escape(head)}", re.I)
     for s in sents[:max_facts]:
         # anchor coreference orphans AND any sentence that never names
         # its own article ("The seat of government is La Paz" must carry
         # "Bolivia:" or the capital question can never find it)
-        if s.lower().startswith(_PRON) or head not in s.lower():
+        if s.lower().startswith(_PRON) or not head_rx.search(s):
             s = f"{title}: {s}"
         if s in existing:
             continue                     # sentence-level dedup
@@ -497,7 +505,10 @@ def watch_youtube(agent, url_or_id: str, namer=None, max_minutes: int = 20) -> d
     from lattice.vision import watch
     heard = False
     try:
-        w = watch(agent, out, namer=namer, label=title, verbose=True)
+        try:
+            w = watch(agent, out, namer=namer, label=title, verbose=True)
+        except Exception as e:      # e.g. no ffmpeg: report, don't crash
+            return {"title": title, "error": f"watch: {e}"}
         # ears: captions if they exist, else LISTEN to the audio (local ASR)
         try:
             chunks = _yt_transcript_chunks(vid)

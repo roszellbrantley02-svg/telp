@@ -38,7 +38,8 @@ def bind_user(hv: np.ndarray) -> np.ndarray:
     return bind(USER_SELF, hv.astype(np.int8))
 
 
-USER_FACTS_DB = _TELP_ROOT / "state" / "user_facts.db"
+from lattice.paths import state_path  # noqa: E402
+USER_FACTS_DB = state_path("user_facts.db")
 
 
 _USER_SCHEMA = """
@@ -94,10 +95,50 @@ _FACT_PATTERNS = [
 ]
 
 
+# Values that look like a slot but aren't facts about the user:
+# "I'm a little tired today" is a mood, not an occupation; "I have a
+# question about Rome" is a request; "I like how you explained that" is
+# feedback.
+_NOT_OCCUPATION = {"little", "bit", "lot", "few", "big", "huge", "kind",
+                   "sort", "very", "quite", "really", "pretty", "total",
+                   "complete", "fan", "huge", "great", "good", "bad",
+                   "new", "first", "second"}
+_TIME_WORDS = re.compile(r"\b(today|tonight|now|right now|lately|again|"
+                         r"anymore|at the moment|these days)\b", re.I)
+_CLAUSE_END = re.compile(r"\s+(?:and|but|or|so|because|who|which|that|with|"
+                         r"at|in|for|from|since|when|while|i|i'm)\b.*$", re.I)
+_NOT_POSSESSION = re.compile(r"^(?:a\s+question|questions?|a\s+query|no\s+idea|"
+                             r"to\b|been\b|got\b|never\b|always\b|just\b|"
+                             r"seen\b|heard\b|read\b|done\b|a\s+feeling)",
+                             re.I)
+_NOT_PREFERENCE = re.compile(r"^(?:how|when|that|this|it|what|your|the\s+way|"
+                             r"to\s+(?:think|know|ask|see))\b", re.I)
+_NAME_STOP = {"and", "but", "or", "i", "i'm", "im", "who", "from", "so"}
+
+
+_REQUEST_RX = re.compile(
+    r"\b(?:can|could|would|will)\s+you\b|\bplease\b|"
+    r"\b(?:tell|show|give|help|teach)\s+me\b|\bexplain\b|"
+    r"\bi\s+have\s+(?:a\s+)?questions?\b")
+
+
+def _clean_name(value: str) -> str:
+    """'Eric and I'm a developer' -> 'Eric'; 'Mary Jane Watson' kept."""
+    words = value.split()
+    out = words[:1]
+    for w in words[1:]:
+        if w.lower() in _NAME_STOP or not w[:1].isupper():
+            break
+        out.append(w)
+    return " ".join(out)
+
+
 def extract_user_facts(msg: str) -> list[dict]:
     """Pull self-referential statements out of a user message.
 
-    Returns a list of {text, kind, raw_match} dicts.
+    Returns a list of {text, kind, raw, slot} dicts. `slot` is the text
+    prefix shared by every value of the same fact ("User's name is "), so a
+    newer value can supersede an older one.
     """
     if not msg:
         return []
@@ -106,29 +147,47 @@ def extract_user_facts(msg: str) -> list[dict]:
         for m in pat.finditer(msg):
             raw = m.group(0).strip()
             captured_value = m.group(1).strip().rstrip(".,!?")
+            slot = None
             # Build a clean first-person fact text
             if kind == "name":
+                captured_value = _clean_name(captured_value)
                 text = f"User's name is {captured_value}."
+                slot = "User's name is "
             elif kind == "occupation":
+                captured_value = _CLAUSE_END.sub("", captured_value).strip()
+                first = captured_value.split()[0].lower() if captured_value else ""
+                if (not captured_value or first in _NOT_OCCUPATION
+                        or _TIME_WORDS.search(captured_value)):
+                    continue
                 text = f"User is a {captured_value}."
+                slot = "User is a "
             elif kind == "location":
+                captured_value = _CLAUSE_END.sub("", captured_value).strip()
                 text = f"User lives in / is from {captured_value}."
+                slot = "User lives in / is from "
             elif kind == "possession":
+                if _NOT_POSSESSION.search(captured_value):
+                    continue
                 text = f"User has {captured_value}."
             elif kind == "preference":
+                if _NOT_PREFERENCE.search(captured_value):
+                    continue
                 text = f"User likes {captured_value}."
             elif kind == "workplace":
                 text = f"User works at {captured_value}."
+                slot = "User works at "
             elif kind == "attribute":
                 attr = m.group(1).strip().lower()
                 if attr in ("name",):        # covered by the name pattern
                     continue
                 text = f"User's {attr} is {m.group(2).strip().rstrip('.,!?')}."
+                slot = f"User's {attr} is "
             elif kind == "remember":
                 text = f"User asked me to remember: {captured_value}."
             else:
                 text = raw
-            facts.append({"text": text, "kind": kind, "raw": raw})
+            facts.append({"text": text, "kind": kind, "raw": raw,
+                          "slot": slot})
     return facts
 
 
@@ -207,6 +266,12 @@ class UserFactsStore:
         if low.endswith("?") or low.startswith(("if ", "what if", "suppose",
                                                 "imagine", "say ")):
             return []
+        # commands and requests aren't facts either: "forget that I have
+        # two cats" must reach the forget route, "I have a question about
+        # Rome, can you help" must get answered
+        if low.startswith(("forget", "don't remember", "do not remember")) \
+                or _REQUEST_RX.search(low):
+            return []
         facts = extract_user_facts(user_msg)
         existing = set(self._texts)
         added = []
@@ -214,13 +279,11 @@ class UserFactsStore:
         # a new value for the SAME slot supersedes the old one - kept as
         # history, no longer served ("my favorite color is green" after
         # "...is blue": he remembers both, believes the newer)
-        _SUPERSEDE_KINDS = {"name", "occupation", "location", "workplace",
-                            "attribute"}
         for f in facts:
             if f["text"] in existing:
                 continue
-            if f["kind"] in _SUPERSEDE_KINDS and " is " in f["text"]:
-                slot = f["text"].split(" is ")[0] + " is "
+            slot = f.get("slot")
+            if slot:
                 olds = self._con.execute(
                     "SELECT id, text FROM user_facts WHERE superseded=0 "
                     "AND text LIKE ? AND text<>?",

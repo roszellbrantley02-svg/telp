@@ -10,7 +10,7 @@ sessions (see standalone_agent._CORPUS_PREFIXES).
 
 Usage:
     # Direct:
-    python -m autopilot.seed_identity
+    python -m mind.seed_identity
 
     # Programmatic (e.g. from chat.py on startup):
     from mind.seed_identity import seed_if_needed
@@ -24,7 +24,8 @@ from pathlib import Path
 _TELP_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_TELP_ROOT))
 
-_MARKER = _TELP_ROOT / "state" / ".identity_seeded"
+from lattice.paths import state_path  # noqa: E402
+_MARKER = state_path(".identity_seeded")
 
 
 # ─── The seed facts ────────────────────────────────────────────────
@@ -37,7 +38,7 @@ IDENTITY_FACTS: list[str] = [
     "Telp is an artificial intelligence agent.",
     "Telp's name is Telp.",
     "Telp was built by his user.",
-    "Telp's brain uses hyperdimensional computing.",
+    "Telp finds answers by comparing the meaning of his memories.",
     "Telp does not use a large language model.",
     "Telp can see images and remember what he has seen.",
     "Telp perceives, remembers, reasons, and speaks as one mind.",
@@ -48,7 +49,6 @@ IDENTITY_FACTS: list[str] = [
     "Telp's knowledge includes Wikipedia, conversations, and what he has seen.",
     "Telp remembers what his user teaches him across sessions.",
     "Telp lives on his user's computer and does not call any cloud API.",
-    "Telp's source code is on E drive in the telp folder.",
 ]
 
 
@@ -62,18 +62,24 @@ def seed(agent, force: bool = False) -> dict:
     if hasattr(agent, "agent") and hasattr(agent.agent, "lattice"):
         agent = agent.agent
 
-    if not force and _MARKER.exists():
+    # seeded = this memory already holds the identity facts (a global
+    # marker file alone said "seeded" even for a brand-new memory file)
+    already = agent.lattice._con.execute(
+        "SELECT 1 FROM memories WHERE tags='identity' LIMIT 1").fetchone()
+    if not force and already:
         return {"seeded": False, "reason": "already seeded",
                   "marker": str(_MARKER)}
 
     n_lattice = 0
     n_claims = 0
     for fact in IDENTITY_FACTS:
-        agent.lattice.add(fact, source="user_taught",
+        # source "identity", not "user_taught": these are built in, and
+        # provenance must not tell the user "you told me" about them
+        agent.lattice.add(fact, source="identity",
                               tags="identity",
                               turn=len(agent.turns))
         agent.encoder.add_sentence(fact)
-        n_claims += agent.structured.add_sentence(fact, source="user_taught")
+        n_claims += agent.structured.add_sentence(fact, source="identity")
         n_lattice += 1
 
     agent.structured._dirty = True

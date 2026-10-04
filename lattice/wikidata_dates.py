@@ -25,7 +25,10 @@ import urllib.request
 from pathlib import Path
 
 _TELP_ROOT = Path(__file__).resolve().parents[1]
-_CACHE_PATH = _TELP_ROOT / "state" / "wikidata_dates.json"
+if str(_TELP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TELP_ROOT))
+from lattice.paths import state_path  # noqa: E402
+_CACHE_PATH = state_path("wikidata_dates.json")   # read by StandaloneAgent
 
 
 _UA = {"User-Agent": "telp-lattice-research/0.1 (educational use)"}

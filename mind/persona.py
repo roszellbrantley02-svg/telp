@@ -103,7 +103,8 @@ def unbind_self(hv: np.ndarray) -> np.ndarray:
 # ─── Persona store ─────────────────────────────────────────────────
 
 
-PERSONA_DB = _TELP_ROOT / "state" / "persona.db"
+from lattice.paths import state_path  # noqa: E402
+PERSONA_DB = state_path("persona.db")
 
 
 _PERSONA_SCHEMA = """
@@ -144,6 +145,7 @@ class PersonaStore:
         self._traits: list[Optional[str]] = []
         self._categories: list[Optional[str]] = []
         self._stack: Optional[np.ndarray] = None
+        self._plain: Optional[np.ndarray] = None
         self._reload()
 
     def _reload(self):
@@ -159,8 +161,21 @@ class PersonaStore:
             self._stack = np.stack(
                 [np.frombuffer(r[2], dtype=np.int8) for r in rows]
             )
+            self._plain = np.stack([self._unbind(self._stack[i], r[3])
+                                    for i, r in enumerate(rows)])
         else:
             self._stack = None
+            self._plain = None
+
+    @staticmethod
+    def _unbind(stored_hv: np.ndarray, trait: Optional[str]) -> np.ndarray:
+        """Undo the SELF (and trait) binding: XOR is its own inverse. Queries
+        rank against these text-space vectors - a trait-bound row compared
+        with a SELF-only query used to score ~0, so 41 of the 54 seeded
+        facts could never be found."""
+        hv = unbind_self(stored_hv)
+        tv = TRAIT_VECTORS.get(trait) if trait else None
+        return bind(tv, hv) if tv is not None else hv
 
     def count(self) -> int:
         return len(self._ids)
@@ -189,10 +204,13 @@ class PersonaStore:
         self._texts.append(text)
         self._traits.append(trait)
         self._categories.append(category)
+        plain = self._unbind(stored_hv, trait)
         if self._stack is None:
             self._stack = stored_hv[None, :].copy()
+            self._plain = plain[None, :].copy()
         else:
             self._stack = np.vstack([self._stack, stored_hv[None, :]])
+            self._plain = np.vstack([self._plain, plain[None, :]])
         return mid
 
     def add_many(self, items: list[dict]) -> None:
@@ -219,11 +237,7 @@ class PersonaStore:
         if self.encoder is None:
             return []
         text_hv = self.encoder.encode(text).astype(np.int8)
-        if trait:
-            q_hv = bind_trait(text_hv, trait)
-        else:
-            q_hv = bind_self(text_hv)
-        xor = np.bitwise_xor(self._stack, q_hv[None, :])
+        xor = np.bitwise_xor(self._plain, text_hv[None, :])
         dists = xor.sum(axis=1)
         order = np.argsort(dists)[:k]
         results = []

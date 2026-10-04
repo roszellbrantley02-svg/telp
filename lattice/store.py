@@ -56,6 +56,46 @@ CREATE INDEX IF NOT EXISTS idx_source     ON memories(source);
 """
 
 
+def merge_legacy_memory(target: str | Path, legacy: str | Path) -> int:
+    """Fold a stray second memory file into the one memory.
+
+    Before the single-memory fix, chat on a fresh install wrote to
+    standalone_lattice.db until learn/see/watch created concept_bridge.db,
+    after which everything taught earlier became invisible. This copies
+    every row of `legacy` that `target` doesn't already hold (same text and
+    source), keeps original timestamps, then renames `legacy` to
+    *.db.merged so it runs once. Returns the number of rows recovered."""
+    target, legacy = Path(target), Path(legacy)
+    if not legacy.exists() or (target.exists() and
+                               target.resolve() == legacy.resolve()):
+        return 0
+    target.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(target), timeout=30.0)
+    try:
+        con.executescript(_SCHEMA)
+        con.execute("ATTACH DATABASE ? AS old", (str(legacy),))
+        has_table = con.execute(
+            "SELECT 1 FROM old.sqlite_master WHERE type='table' "
+            "AND name='memories'").fetchone()
+        n = 0
+        if has_table:
+            cur = con.execute(
+                "INSERT INTO memories (created_at, text, hv, metadata, "
+                "source, tags) "
+                "SELECT o.created_at, o.text, o.hv, o.metadata, o.source, "
+                "o.tags FROM old.memories o WHERE NOT EXISTS ("
+                "  SELECT 1 FROM memories m WHERE m.text = o.text"
+                "  AND IFNULL(m.source, '') = IFNULL(o.source, ''))"
+                " ORDER BY o.id")
+            n = cur.rowcount
+        con.commit()
+        con.execute("DETACH DATABASE old")
+    finally:
+        con.close()
+    legacy.rename(legacy.with_name(legacy.name + ".merged"))
+    return n
+
+
 # ─── Lattice ───────────────────────────────────────────────────────
 
 
@@ -87,7 +127,8 @@ class Lattice:
         self._ids: list[int] = []
         self._texts: list[str] = []
         self._sources: list[str] = []
-        self._stack: Optional[np.ndarray] = None   # shape (N, D)
+        self._stack: Optional[np.ndarray] = None   # shape (N, D), view of _buf
+        self._buf: Optional[np.ndarray] = None     # growth buffer behind _stack
         # GPU mirror — populated by _reload_from_disk + _add_with_hv
         # when device != "cpu".
         import os as _os
@@ -107,10 +148,37 @@ class Lattice:
         self._sources = [r[3] or "" for r in rows]
         if rows:
             vecs = [np.frombuffer(r[2], dtype=np.int8) for r in rows]
-            self._stack = np.stack(vecs)
+            self._buf = np.stack(vecs)
+            self._stack = self._buf
         else:
+            self._buf = None
             self._stack = None
         self._push_to_device()
+        self._data_version = self._disk_version()
+
+    def _disk_version(self) -> int:
+        return self._con.execute("PRAGMA data_version").fetchone()[0]
+
+    def changed_on_disk(self) -> bool:
+        """True when another process (or connection) has committed to the
+        memory file since we last loaded it - teach/learn/forget run in
+        their own processes, so the resident daemon must notice."""
+        return self._disk_version() != self._data_version
+
+    def _append_rows(self, hvs: np.ndarray) -> None:
+        """Append rows to the in-memory stack with amortized growth.
+        np.vstack per add copied the whole N x D stack every time (220 MB
+        per add at 22K memories); a doubling buffer makes adds O(1)."""
+        n_old = 0 if self._stack is None else self._stack.shape[0]
+        n_new = n_old + hvs.shape[0]
+        if self._buf is None or n_new > self._buf.shape[0]:
+            cap = max(n_new, 2 * (0 if self._buf is None else self._buf.shape[0]), 64)
+            buf = np.empty((cap, D), dtype=np.int8)
+            if n_old:
+                buf[:n_old] = self._stack
+            self._buf = buf
+        self._buf[n_old:n_new] = hvs
+        self._stack = self._buf[:n_new]
 
     def delete_ids(self, ids: list[int]) -> list[str]:
         """Surgical forgetting: remove specific memories by id. The ONE
@@ -189,15 +257,13 @@ class Lattice:
               source or None, tags or None)
         )
         self._con.commit()
+        self._data_version = self._disk_version()   # our own write
         mid = cur.lastrowid
         # Append to in-memory stack
         self._ids.append(mid)
         self._texts.append(text)
         self._sources.append(source or "")
-        if self._stack is None:
-            self._stack = hv[None, :].copy()
-        else:
-            self._stack = np.vstack([self._stack, hv[None, :]])
+        self._append_rows(hv[None, :])
         # Append to GPU mirror too (when active).
         if self._stack_t is not None:
             try:
@@ -241,6 +307,7 @@ class Lattice:
         except Exception:
             self._con.rollback()
             raise
+        self._data_version = self._disk_version()   # our own write
         # Update in-memory parallel structures in bulk
         new_texts = [t for t, _, _ in items]
         new_srcs  = [s or "" for _, _, s in items]
@@ -248,10 +315,7 @@ class Lattice:
         self._ids.extend(ids)
         self._texts.extend(new_texts)
         self._sources.extend(new_srcs)
-        if self._stack is None:
-            self._stack = new_hvs
-        else:
-            self._stack = np.vstack([self._stack, new_hvs])
+        self._append_rows(new_hvs)
         # Refresh GPU mirror after bulk insert (cheaper to re-upload
         # than incrementally cat() one row at a time).
         if self._stack_t is not None:

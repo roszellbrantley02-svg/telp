@@ -201,10 +201,24 @@ _BUILD_APP_RX = re.compile(
     r"\b(?:build|make|create|write|generate)\s+(?:me\s+)?"
     r"(?:a\s+|an\s+|some\s+)?"
     r"(\w+(?:[- ]\w+)?)\s+"
-    r"(?:app|application|cli|tracker|tracker|manager|journal|list|"
-    r"tool|program|script|system|store|book|database)",
+    r"(app|application|cli|tracker|manager|journal|list|"
+    r"tool|program|script|system|store|book|database)\b",
     re.IGNORECASE,
 )
+
+# Heads that on their own mean "an app". The weak ones (list, script,
+# tool...) only count when the thing named is an entity we have a schema
+# for: "build a todo list" is an app, "make a shopping list" and "write a
+# python script to reverse a string" are not.
+_STRONG_HEADS = {"app", "application", "cli", "tracker", "manager",
+                 "journal", "database"}
+
+# "write a python script ..." names a LANGUAGE, not the app's entity
+_LANGUAGES = {"python", "py", "bash", "shell", "sh", "zsh", "powershell",
+              "javascript", "js", "typescript", "ts", "node", "ruby", "perl",
+              "php", "java", "kotlin", "go", "golang", "rust", "c", "cpp",
+              "c++", "csharp", "sql", "lua", "r", "swift", "small", "simple",
+              "quick", "basic", "little", "short", "new"}
 
 
 # Aliases — phrases users say that map to a canonical entity name.
@@ -261,6 +275,9 @@ def detect_app_intent(msg: str) -> Optional[dict]:
     if not m:
         return None
     raw_entity = m.group(1).lower().strip()
+    head = m.group(2).lower()
+    if raw_entity.split()[0] in _LANGUAGES:
+        return None
     # Normalize: strip trailing "taking" / "tracking" filler
     raw_clean = re.sub(r"\s+(taking|tracking|management|keeping)$",
                               "", raw_entity)
@@ -275,6 +292,8 @@ def detect_app_intent(msg: str) -> Optional[dict]:
             entity = raw_clean
         elif raw_clean.rstrip("s") in ENTITY_SCHEMAS:
             entity = raw_clean.rstrip("s")
+    if entity is None and head not in _STRONG_HEADS:
+        return None
     return {
         "entity":   entity,                # may be None → generic fallback
         "raw":      raw_entity,

@@ -53,7 +53,8 @@ from lattice.g2p_and_prosody import (
 
 
 _TELP_ROOT = Path(__file__).resolve().parents[1]
-LATTICE_PATH = _TELP_ROOT / "state" / "reading_lattice.pkl"
+from lattice.paths import state_path  # noqa: E402
+LATTICE_PATH = state_path("reading_lattice.pkl")
 
 
 # --- Prosody role HVs (deterministic) -----------------------------

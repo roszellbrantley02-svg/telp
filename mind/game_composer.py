@@ -414,6 +414,13 @@ _GENERIC_GAME_RX = re.compile(
 )
 
 
+_GAME_VERB_RX = re.compile(
+    r"\b(?:build|make|create|write|code|program|generate|play|start|"
+    r"give\s+me|show\s+me|let'?s|want\s+to|wanna|can\s+we)\b",
+    re.IGNORECASE,
+)
+
+
 def detect_game_intent(msg: str) -> Optional[str]:
     """Return the game key (e.g., 'hangman') or None.
 
@@ -424,10 +431,18 @@ def detect_game_intent(msg: str) -> Optional[str]:
     """
     if not msg:
         return None
-    # First: check each game's intent patterns (specific names win).
+    # A game NAME alone isn't a request to build one: "what are the rules
+    # of tic-tac-toe?" and "who invented rock paper scissors?" are
+    # questions. Specific games need a build/play verb, or the message
+    # has to be little more than the game's name ("hangman!").
+    wants_game = bool(_GAME_VERB_RX.search(msg))
     for key, spec in GAMES.items():
         for pat in spec["intents"]:
-            if re.search(pat, msg, re.IGNORECASE):
+            m = re.search(pat, msg, re.IGNORECASE)
+            if not m:
+                continue
+            rest = (msg[:m.start()] + msg[m.end():]).strip(" .!?,").lower()
+            if wants_game or rest in ("", "game", "a game", "play"):
                 return key
 
     # Second: generic "a game" request → default.
@@ -461,7 +476,7 @@ def try_compose_game(msg: str, run: bool = True) -> Optional[dict]:
     }
     if run:
         from mind.code_writer import _safe_run
-        ok, out = _safe_run(code, timeout=10.0)
+        ok, out = _safe_run(code, timeout=10.0, demo_only=True)
         result["ran"]    = ok
         result["output"] = out
     return result

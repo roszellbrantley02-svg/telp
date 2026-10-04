@@ -99,9 +99,19 @@ def extract_literal_list(msg: str) -> Optional[list]:
     )
     if m:
         tail = m.group(1).strip().rstrip(".?!")
-        # Look for at least two comma-separated tokens
-        parts = [p.strip().strip("'\"") for p in re.split(r"[,\s]+", tail)
-                  if p.strip()]
+        # Data must look like data: comma-separated items ("bob, alice,
+        # carol"), or space-separated NUMBERS ("5 3 9"). Plain words split
+        # on spaces are the sentence itself - "sort a list then reverse
+        # it" became the list ['it', 'reverse', 'then'].
+        if "," in tail:
+            parts = [p.strip().strip("'\"") for p in tail.split(",")
+                     if p.strip()]
+            if any(len(p.split()) > 3 for p in parts):
+                parts = []                 # clauses, not items
+        else:
+            parts = [p for p in tail.split() if p.strip()]
+            if not all(re.fullmatch(r"-?\d+(?:\.\d+)?", p) for p in parts):
+                parts = []
         if len(parts) >= 2:
             parsed = []
             for p in parts:
@@ -762,13 +772,36 @@ def classify_intent(msg: str,
     return None
 
 
-# ─── Sandboxed execution ──────────────────────────────────────────
+# ─── Isolated execution ───────────────────────────────────────────
+#
+# NOT a security sandbox: the blocklist is easy to get around. Only
+# Telp's own templates are run, with user values substituted as literals.
+# What this does guarantee: no keyboard input (input() gets EOF at once -
+# an inherited stdin used to freeze the chat and swallow what you typed),
+# a throwaway working directory, no inherited secrets/proxies in the
+# environment, and on POSIX hard caps on memory, CPU time and file size.
 
 
-def _safe_run(code: str, timeout: float = 5.0) -> tuple[bool, str]:
+def _limit_child() -> None:          # runs in the child (POSIX only)
+    import resource
+    mb = 1024 * 1024
+    for res, val in ((resource.RLIMIT_AS, 1024 * mb),
+                     (resource.RLIMIT_FSIZE, 16 * mb),
+                     (resource.RLIMIT_CPU, 20)):
+        try:
+            resource.setrlimit(res, (val, val))
+        except (ValueError, OSError):
+            pass
+
+
+def _safe_run(code: str, timeout: float = 5.0,
+              demo_only: bool = False) -> tuple[bool, str]:
     """Run code in a fresh subprocess.  Captures stdout/stderr.
-    Returns (ok, output_text).
+    Returns (ok, output_text). demo_only runs the file under a non-main
+    module name, so an interactive `if __name__ == "__main__":` block is
+    skipped and only the scripted demo prints.
     """
+    import os
     # Quick syntax check
     try:
         ast.parse(code)
@@ -777,39 +810,36 @@ def _safe_run(code: str, timeout: float = 5.0) -> tuple[bool, str]:
     # Refuse obviously unsafe patterns
     blocklist = ("os.system", "subprocess.", "shutil.rmtree",
                   "__import__", "eval(", "exec(")
-    # We allow open( (file I/O is intentional in many templates).
-    # We allow input(  — subprocess has no stdin attached, so input()
-    # raises EOFError immediately rather than hanging.  Game templates
-    # legitimately define play() functions using input().
     for bad in blocklist:
         if bad in code:
             return False, f"refusing to run code containing {bad!r}"
 
-    # Run in a subprocess with -I (isolated) to avoid env interference.
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False, encoding="utf-8",
-    )
-    try:
-        tmp.write(code)
-        tmp.close()
+    with tempfile.TemporaryDirectory(prefix="telp-run-") as workdir:
+        script = Path(workdir) / "snippet.py"
+        script.write_text(code, encoding="utf-8")
+        env = {"PATH": os.environ.get("PATH", ""),
+               "PYTHONIOENCODING": "utf-8",
+               "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")}  # Windows
         try:
+            argv = ([sys.executable, "-I", "-W", "ignore", "-c",
+                     "import runpy, sys; "
+                     "runpy.run_path(sys.argv[1], run_name='telp_demo')",
+                     str(script)] if demo_only else
+                    [sys.executable, "-I", "-W", "ignore", str(script)])
             res = subprocess.run(
-                [sys.executable, "-I", "-W", "ignore", tmp.name],
+                argv,
                 capture_output=True, text=True, timeout=timeout,
-                check=False,
+                check=False, stdin=subprocess.DEVNULL, cwd=workdir,
+                env=env,
+                preexec_fn=_limit_child if os.name == "posix" else None,
             )
-            out = (res.stdout or "")
-            err = (res.stderr or "")
-            if res.returncode != 0:
-                return False, (out + err).strip()[:2000]
-            return True, out.strip()[:2000]
         except subprocess.TimeoutExpired:
             return False, f"(execution exceeded {timeout}s)"
-    finally:
-        try:
-            Path(tmp.name).unlink(missing_ok=True)
-        except Exception:
-            pass
+        out = (res.stdout or "")
+        err = (res.stderr or "")
+        if res.returncode != 0:
+            return False, (out + err).strip()[:2000]
+        return True, out.strip()[:2000]
 
 
 # ─── Layer 2: parameter customization ────────────────────────────
@@ -955,6 +985,14 @@ def _compose_pipeline(template_results: list[dict]) -> str:
     """
     if not template_results:
         return ""
+    # 0. Keep every template's top-level imports - dropping them made
+    # "sort [3,1,2,3] then count" fail with NameError: Counter
+    imports: list[str] = []
+    for t in template_results:
+        for line in t["code"].split("\n"):
+            if (re.match(r"^(?:import|from)\s+\w", line)
+                    and line.strip() not in imports):
+                imports.append(line.strip())
     # 1. Collect all unique function definitions
     func_defs: list[str] = []
     seen_funcs: set[str] = set()
@@ -981,7 +1019,9 @@ def _compose_pipeline(template_results: list[dict]) -> str:
             if fname:
                 pipeline_lines.append(f"value = {fname}(value)")
         pipeline_lines.append("print(value)")
-    return "\n\n".join(func_defs) + "\n" + "\n".join(pipeline_lines) + "\n"
+    head = ("\n".join(imports) + "\n\n\n") if imports else ""
+    return (head + "\n\n".join(func_defs) + "\n"
+            + "\n".join(pipeline_lines) + "\n")
 
 
 def _extract_function_blocks(code: str) -> list[str]:
@@ -1014,14 +1054,23 @@ def _first_func_name(code: str) -> Optional[str]:
 
 
 def _extract_first_example_input(code: str) -> Optional[object]:
-    """Try to pull the literal argument of the first example call."""
-    for line in code.split("\n"):
-        m = re.search(r"\w+\((\[.*?\]|'[^']*'|\"[^\"]*\"|\d+)\)", line)
-        if m:
-            try:
-                return ast.literal_eval(m.group(1))
-            except Exception:
-                return None
+    """The literal argument of the first example call at module level.
+    Calls inside function bodies don't count - grabbing those turned
+    fizzbuzz's own 'FizzBuzz' string into the pipeline's input."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef, ast.Import, ast.ImportFrom)):
+            continue
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Call) and node.args:
+                try:
+                    return ast.literal_eval(node.args[0])
+                except (ValueError, SyntaxError, TypeError):
+                    continue
     return None
 
 

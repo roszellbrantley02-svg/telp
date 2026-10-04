@@ -29,15 +29,8 @@ _DEF_STRONG = re.compile(
     r"^[A-Z][\w' ,-]{1,64}\s+(?:is|was|are|were)\s+(?:a|an|the|one)\b")
 
 _SKIP_SOURCES = ("user_msg", "agent_response", "conversation_turn",
-                 "image:", "video:")
+                 "image:", "video:", "story:")
 
-_PARA_CONNECT = [
-    "",                       # lead paragraph opens cold
-    "There is more to it. ",
-    "Beyond the basics: ",
-    "It reaches further still. ",
-    "And the story keeps going: ",
-]
 
 _ANCHOR_RE = re.compile(r"^([^:]{2,48}):\s+(?=[A-Z0-9\"'])")
 
@@ -185,27 +178,28 @@ def compose_essay(agent, topic: str, emb_fn,
             picked.append(i)
         if len(picked) < 2:
             continue
-        sents = []
+        sents = []                      # (clean sentence, stored memory)
         for i in picked:
             s = _clean_sentence(rows[i][0])
             if s is None:
                 continue
-            sents.append(s)
+            sents.append((s, rows[i][0]))
             used.append(rows[i])
         if len(sents) < 2:
             continue
         # the topic's own definition leads its paragraph
-        sents.sort(key=_def_rank)
-        # HIS voice: dictionary-licensed simplification + splits, each
-        # sentence verified by embedding round-trip (reverts on drift)
+        sents.sort(key=lambda p: _def_rank(p[0]))
+        # HIS voice: dictionary-licensed simplification + splits; each
+        # rewording is checked against the STORED memory and reverts on
+        # drift
         styled = []
-        for s in sents:
-            s2, k = restyle(s, emb_fn)
+        for s, raw in sents:
+            s2, k = restyle(s, emb_fn, original=raw)
             n_restyled += k
             styled.append(s2)
-        para = (_PARA_CONNECT[min(pi, len(_PARA_CONNECT) - 1)]
-                + " ".join(styled))
-        paragraphs.append(para)
+        # no connective filler between paragraphs: every sentence in the
+        # essay is a memory
+        paragraphs.append(" ".join(styled))
 
     if len(paragraphs) < 2:
         return None
@@ -215,11 +209,13 @@ def compose_essay(agent, topic: str, emb_fn,
         return (s.split(":", 1)[0] + ":" + t[:i].strip()) if i > 1 else s
 
     srcs = sorted({_label(s) for _, s in used})
-    outro = ("Every sentence above is a memory I hold, drawn from: "
+    outro = ("Every sentence above comes from a memory I hold, lightly "
+             "simplified, drawn from: "
              + "; ".join(srcs[:6])
              + (" and more" if len(srcs) > 6 else "") + "."
-             + ((" Rephrased only by dictionary-licensed rules, each "
-                 "verified to preserve the original meaning.")
+             + ((f" {n_restyled} wording change(s) used dictionary synonyms "
+                 "or sentence splits, kept only where they stayed close in "
+                 "meaning to the stored memory.")
                 if n_restyled else ""))
     essay = "\n\n".join(paragraphs) + "\n\n" + outro
     return essay, [t for t, _ in used], srcs

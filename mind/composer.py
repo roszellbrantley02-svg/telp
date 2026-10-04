@@ -17,13 +17,63 @@ import re
 
 # ── deterministic sentence clean-up ─────────────────────────────────
 
-_PAREN_RE = re.compile(r"\s*\([^()]*\)")
+_PAREN_RE = re.compile(r"\s*\(([^()]*)\)")
+# Parentheticals that are reading noise - pronunciations, etymologies,
+# life dates, empty husks. Everything else ("(overdose can cause fatal
+# liver damage)", "(until it was reclassified)") carries meaning and stays.
+_PAREN_NOISE_RE = re.compile(
+    r"^\s*(?:pronounced|pronunciation|listen|ipa|lit\.|literally|abbr|"
+    r"abbreviated|also\s+spelled|from|latin|greek|ancient\s+greek|"
+    r"old\s+english|middle\s+english|french|german|spanish|italian|"
+    r"portuguese|dutch|arabic|hebrew|persian|russian|chinese|japanese|"
+    r"korean|sanskrit|hindi|born|n[ée]e|died|c\.|ca\.|circa|fl\.)\b", re.I)
+_PAREN_DATES_RE = re.compile(
+    r"^\s*(?:c\.\s*|ca\.\s*)?\d{1,4}(?:\s*(?:BCE?|AD|CE))?"
+    r"(?:\s*[-\u2013\u2014/]\s*(?:c\.\s*)?\d{1,4}(?:\s*(?:BCE?|AD|CE))?)?\s*$",
+    re.I)
+# a clause starting with one of these changes what the sentence means, so
+# a long sentence is never cut in front of it
+_QUALIFIER_RE = re.compile(
+    r"\b(?:but|although|though|however|except|unless|until|yet|whereas|"
+    r"while|not|no|never|nor|only|if|without|despite|instead|rather|"
+    r"cannot|warning|risk|danger|fatal|toxic|avoid|exceed)\b|n't", re.I)
+
+
+_DATE_WORDS = {"january", "february", "march", "april", "may", "june",
+               "july", "august", "september", "october", "november",
+               "december", "born", "died", "c", "ca", "circa", "bc", "bce",
+               "ad", "ce", "or", "and", "st", "nd", "rd", "th", "fl"}
+
+
+def _is_noise_paren(inner: str) -> bool:
+    if not re.search(r"[A-Za-z0-9]", inner):
+        return True                                   # "(; )" husks
+    if _PAREN_NOISE_RE.match(inner) or _PAREN_DATES_RE.match(inner):
+        return True
+    # language glosses and pronunciations: "(Icelandic: Ísland; ...)"
+    if (re.match(r"^\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\s*:", inner)
+            or re.search(r"\bpronounced\b|\[[^\]]*[\u0250-\u02ff][^\]]*\]"
+                         r"|/[^/\s][^/]*/", inner)):
+        return True
+    # life dates: "(15 February 1564 – 8 January 1642)"
+    words = re.findall(r"[A-Za-z]+", inner)
+    return (bool(re.search(r"\b\d{3,4}\b", inner))
+            and all(w.lower() in _DATE_WORDS for w in words))
+
+
+def _strip_noise_parens(s: str) -> str:
+    prev = None
+    while prev != s:        # repeat for one level of nesting
+        prev = s
+        s = _PAREN_RE.sub(
+            lambda m: "" if _is_noise_paren(m.group(1)) else m.group(0), s)
+    return s
 _OFFICIAL_RE = re.compile(
     r"^([A-Z][\w' -]{1,40}?),\s+(?:officially|formally|also known as|sometimes"
     r" called|commonly (?:referred to as|known as|called))[^,]{0,80},"
     r"\s+(is|was|are|were)\b")
 _TOPIC_PRON_RE = re.compile(
-    r"^(.{2,48}?):\s+(It|Its|He|His|She, |Her|They|Their)\b")
+    r"^(.{2,48}?):\s+(It|Its|He|His|She|Her|They|Their)\b")
 
 
 def simplify(fact: str, max_len: int = 230) -> str:
@@ -37,20 +87,22 @@ def simplify(fact: str, max_len: int = 230) -> str:
                 "They": topic, "Their": f"{topic}'s", "His": f"{topic}'s",
                 "Her": f"{topic}'s"}.get(pron, topic)
         s = repl + s[m.end():]
-    # strip parentheticals (incl. pronunciation husks like "(; )") - twice
-    # for one level of nesting
-    s = _PAREN_RE.sub("", s)
-    s = _PAREN_RE.sub("", s)
+    # strip noise parentheticals (pronunciations, life dates, "(; )"
+    # husks); meaningful ones stay
+    s = _strip_noise_parens(s)
     # "X, officially the Republic of Y, is" -> "X is"
     s = _OFFICIAL_RE.sub(r"\1 \2", s)
     # leftover doubled spaces / stray punctuation
     s = re.sub(r"\s+([,.;:])", r"\1", s)
     s = re.sub(r"\s{2,}", " ", s).strip()
     s = re.sub(r"^[,;:\s]+", "", s)
-    # long sentence: cut at a clause boundary past the halfway point
-    if len(s) > max_len:
-        cut = s.rfind(",", 100, max_len)
-        s = s[:cut] if cut > 100 else s[:max_len].rsplit(" ", 1)[0]
+    # long sentence: cut at a clause boundary past the halfway point - but
+    # only when the dropped clause doesn't qualify the rest ("..., but
+    # later researchers argued it was flawed"). Otherwise keep it whole:
+    # a long true sentence beats a short misleading one.
+    cut = s.rfind(",", 100, max_len) if len(s) > max_len else -1
+    if cut > 100 and not _QUALIFIER_RE.search(s[cut + 1:]):
+        s = s[:cut]
         # never end on a dangler - iterate, because stripping one can
         # expose another ("...to the receiving" -> "...to the" -> done)
         _dangler = re.compile(

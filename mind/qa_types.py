@@ -43,7 +43,7 @@ _TYPE_PATTERNS = [
     # date / when / year
     (QTYPE_DATE, re.compile(
         r"^\s*(when|what\s+(?:year|date|time|month|day)|"
-        r"what\s+time|how\s+old)\b", re.IGNORECASE)),
+        r"what\s+time)\b", re.IGNORECASE)),
     # person / who
     (QTYPE_PERSON, re.compile(
         r"^\s*(who(?:'s|\s+is|\s+was|\s+are|\s+were)?\b|"
@@ -56,7 +56,7 @@ _TYPE_PATTERNS = [
         re.IGNORECASE)),
     # quantity / how many / how much / numeric
     (QTYPE_QUANTITY, re.compile(
-        r"^\s*(how\s+(?:many|much|long|tall|big|fast|far)\b|"
+        r"^\s*(how\s+(?:many|much|long|tall|big|fast|far|old)\b|"
         r"what\s+is\s+(?:the\s+)?(?:speed|number|count|size|"
         r"weight|height|distance|amount|cost|price))",
         re.IGNORECASE)),
@@ -103,15 +103,19 @@ def classify_question(msg: str) -> str:
 # A "date-shaped" token: 4-digit year, or month+year, or "DDth century",
 # or a "X years ago / X days ago", or an explicit YYYY-MM-DD.
 _DATE_RX = re.compile(
-    r"\b(?:"
-    r"(?:1[5-9]\d{2}|20\d{2}|21\d{2})"     # year 1500-2199
-    r"|(?:January|February|March|April|May|June|July|August|"
-        r"September|October|November|December)\s+\d"
-    r"|\d{1,2}(?:st|nd|rd|th)\s+century"
-    r"|\d{1,2}-\d{1,2}-\d{2,4}"
-    r"|\d{4}-\d{2}-\d{2}"
-    r"|(?:bce?|bc|ad|ce)"
-    r")\b",
+    r"(?:"
+    r"\b(?:1\d{3}|20\d{2}|21\d{2})\b"         # year 1000-2199 (1066, 1492)
+    r"|\b(?:January|February|March|April|May|June|July|August|"
+        r"September|October|November|December)\s+\d{1,4}\b"
+    r"|\b\d{1,2}\s+(?:January|February|March|April|May|June|July|"
+        r"August|September|October|November|December)\b"
+    r"|\b\d{1,2}(?:st|nd|rd|th)\s+century\b"
+    r"|\b\d{1,2}-\d{1,2}-\d{2,4}\b"
+    r"|\b\d{4}-\d{2}-\d{2}\b"
+    r"|\b\d{1,4}\s*(?:BCE?|AD|CE)\b"               # 753 BC, 79 AD
+    r"|\b(?:AD|CE)\s*\d{1,4}\b"                    # AD 79
+    r"|\b(?:years?|centuries|decades)\s+ago\b"
+    r")",
     re.IGNORECASE,
 )
 

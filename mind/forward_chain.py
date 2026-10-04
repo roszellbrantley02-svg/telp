@@ -152,9 +152,14 @@ def _handler_age_at_event(agent, person: str, event: str) -> Optional[dict]:
     if born is None or event_year is None:
         return None
     age = event_year - born
+    if age < 0:             # the event predates the person: wrong match
+        return None
+    # the event clause is the user's own words ("the civil war started",
+    # "relativity was published") - never bolt a verb onto it; year
+    # arithmetic is only exact to within one birthday, so say "about"
     return {
-        "answer": (f"{p.title()} was {age} years old when "
-                       f"{e} was published in {event_year}."),
+        "answer": (f"{p.title()} was about {age} years old when "
+                       f"{event.strip()} ({event_year})."),
         "chain": [
             f"{p} born → {born}",
             f"{e} → {event_year}",

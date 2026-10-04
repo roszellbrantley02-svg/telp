@@ -57,6 +57,7 @@ _TELP_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_TELP_ROOT))
 
 from lattice.standalone_agent import StandaloneAgent
+from lattice.paths import MEMORY_DB, state_path
 from mind.qa_types import (
     classify_question, answer_matches_type, type_aware_score,
     answer_mentions_subject,
@@ -93,7 +94,9 @@ _ABSTAIN_PHRASES = [
 
 
 # Light hedge prefixes by confidence band.
-_HEDGE_HIGH = ["", "Yes — ", ""]                 # blank = no hedge
+# no "Yes — " here: prefixed at random onto a confident answer it could
+# turn "Is Pluto a planet?" -> "Yes — Pluto is a dwarf planet."
+_HEDGE_HIGH = [""]                               # blank = no hedge
 _HEDGE_MED  = ["I think ", "I believe ", "From what I know, "]
 _HEDGE_LOW  = ["I'm not certain, but ", "I'm less sure here, but ",
                "Tentatively — "]
@@ -123,11 +126,17 @@ _DEBUG_LEAK_PATTERNS = [
 ]
 
 
+# Rows that are not facts: echoes of the conversation, perception logs,
+# and stories Telp made up. None of them may come back as an answer.
+_NOT_FACT_SOURCES = ("user_msg", "agent_response", "conversation_turn",
+                     "image:", "video:", "story:")
+
 _ABSTAIN_TRIGGERS = (
     "(no retrieval hits)",
     "i'm not sure",
     "i don't have information",
     "i haven't been taught",
+    "i don't have any memories or facts",
     "no matches found",
     "i don't have a confident answer",
     "very low confidence",
@@ -259,8 +268,9 @@ def _normalize(text: str) -> str:
     # Fix standalone lowercase 'i' (common after hedge prefix)
     s = re.sub(r"\bi\b", "I", s)
     s = re.sub(r"\bi'(m|ve|d|ll)\b", lambda m: "I'" + m.group(1), s)
-    # Make sure it ends with punctuation
-    if s[-1] not in ".!?":
+    # Make sure it ends with punctuation (a closing bracket or quote after
+    # the full stop counts: "...when written.)" must not become ".).")
+    if not re.search(r"[.!?][)\]\"'\u201d]*$", s):
         s = s + "."
     return s
 
@@ -321,18 +331,19 @@ class FluentTelp:
         import os as _os
         use_learned = _os.environ.get("TELP_USE_LEARNED", "0") == "1"
 
+        self._use_learned = False
         if lattice_path is None:
-            cb_path = _TELP_ROOT / "state" / "concept_bridge.db"
-            learned_path = _TELP_ROOT / "state" / "concept_bridge_learned.db"
-            enc_path = _TELP_ROOT / "state" / "diff_encoder.pt"
+            # ONE memory for every command (lattice/paths.py). The old
+            # "use concept_bridge.db only if it exists" fallback meant chat
+            # wrote to a second file until the first learn/see/watch
+            # created this one - and then everything taught was orphaned.
+            learned_path = state_path("concept_bridge_learned.db")
+            enc_path = state_path("diff_encoder.pt")
             if use_learned and learned_path.exists() and enc_path.exists():
                 lattice_path = learned_path
                 self._use_learned = True
-            elif cb_path.exists():
-                lattice_path = cb_path
-                self._use_learned = False
             else:
-                self._use_learned = False
+                lattice_path = MEMORY_DB
 
         # If the learned encoder is in play, override the agent's
         # default CorpusRIEncoder with the learned one so retrieval
@@ -340,8 +351,7 @@ class FluentTelp:
         if getattr(self, "_use_learned", False):
             from lattice.diff_text_encoder import DifferentiableTextEncoder
             from lattice.learned_encoder_adapter import LearnedHDCEncoder
-            diff = DifferentiableTextEncoder.load(
-                _TELP_ROOT / "state" / "diff_encoder.pt")
+            diff = DifferentiableTextEncoder.load(state_path("diff_encoder.pt"))
             learned_enc = LearnedHDCEncoder(diff)
             # skip_ri_retrain=True saves ~30s — we're swapping the
             # encoder out so the RI retrain is wasted work.  Also skip
@@ -693,6 +703,8 @@ class FluentTelp:
         # ── Filter: drop low-quality + dialog-scaffolded ──────
         cleaned = []
         for h in hits:
+            if str(h.get("source", "")).startswith(_NOT_FACT_SOURCES):
+                continue
             sim = float(h.get("similarity") or 0.0)
             if sim < 0.50:    # tighter floor than before
                 continue
@@ -730,6 +742,7 @@ class FluentTelp:
                 continue
             cleaned.append({
                 "text":   txt,
+                "raw":    h.get("text") or "",   # the stored row, for citing
                 "sim":    sim,
                 "source": h.get("source", "") or "",
                 "words":  words,
@@ -786,7 +799,10 @@ class FluentTelp:
         anchor = kept[0]
         composed_sentences = [_normalize(anchor["text"])]
         composed_words = anchor["words"].copy()
-        sources_used = [{"source": anchor["source"], "sim": anchor["sim"]}]
+        # keep the memory TEXT with each source: provenance looks rows up
+        # by text, and source names alone matched nothing
+        sources_used = [{"source": anchor["source"], "sim": anchor["sim"],
+                         "text": anchor.get("raw") or anchor["text"]}]
         for h in kept[1:]:
             if not h["words"]:
                 continue
@@ -795,7 +811,8 @@ class FluentTelp:
                 continue
             composed_sentences.append(_normalize(h["text"]))
             composed_words |= h["words"]
-            sources_used.append({"source": h["source"], "sim": h["sim"]})
+            sources_used.append({"source": h["source"], "sim": h["sim"],
+                                 "text": h.get("raw") or h["text"]})
             if len(composed_sentences) >= 3:
                 break
 
@@ -809,7 +826,7 @@ class FluentTelp:
             return self._md_source_quality(src or "")
 
         p_disagree = 1.0
-        for h in kept[:len(sources_used)]:
+        for h in sources_used:      # the rows actually composed
             p_i = h["sim"] * _src_q_factor(h["source"])
             p_i = max(0.0, min(0.95, p_i))
             p_disagree *= (1.0 - p_i)
@@ -940,7 +957,7 @@ class FluentTelp:
         "legacy:", "wisdom:", "github:", "fred:", "reddit:", "youtube:",
     )
 
-    _IDENTITY_SOURCE_PREFIXES = ("user_taught",)
+    _IDENTITY_SOURCE_PREFIXES = ("identity", "user_taught")
 
     def _classify_query(self, msg: str) -> str:
         low = msg.lower()
@@ -1042,14 +1059,14 @@ class FluentTelp:
                 # statement so "who are you?" gets answered.
                 for text, src in zip(self.agent.lattice._texts,
                                           self.agent.lattice._sources):
-                    if (src.startswith("user_taught") and
+                    if (src.startswith(self._IDENTITY_SOURCE_PREFIXES) and
                             "telp" in text.lower() and
                             len(text) < 80):
                         return (text, 0.30)
                 return None
             for text, src in zip(self.agent.lattice._texts,
                                       self.agent.lattice._sources):
-                if not src.startswith("user_taught"):
+                if not src.startswith(self._IDENTITY_SOURCE_PREFIXES):
                     continue
                 text_tokens = set(re.findall(r"\b[a-z]{4,}\b",
                                                  text.lower()))
@@ -1552,22 +1569,36 @@ class FluentTelp:
         })
         return shaped
 
-    def _howto_miss(self, question: str, answer_text: str) -> bool:
-        """Procedural questions demand the HOW be covered: egg biology must not
-        satisfy 'how do I boil an egg' on any answer path."""
-        if not answer_text or not re.match(r"^how (do|to|can|would|should)",
-                                           question.lower()):
+    def _facet_miss(self, question: str, answer_text: str) -> bool:
+        """A topical answer is not an answering answer - on EVERY path, not
+        just the semantic one (a rejection there used to fall through to
+        multi-doc and the legacy fallback, which served the same rows
+        unchecked). Procedural questions demand the HOW be covered: egg
+        biology must not satisfy 'how do I boil an egg'."""
+        if not answer_text:
             return False
-        focus = [w for w in re.findall(r"[a-z]{3,}", question.lower())
+        q = question.lower().strip()
+        if re.match(r"^how (do|to|can|would|should)", q):
+            bar = 0.55
+        elif self._ROLE_RE.match(question.strip()):
+            bar = 0.50
+        elif (re.match(r"^(what|who|whom|whose|where|when|which|why|how)\b",
+                       q) or q.endswith("?")):
+            bar = 0.42
+        else:
+            return False
+        focus = [w for w in re.findall(r"[a-z]{3,}", q)
                  if w not in self._SEM_STOP]
         if not focus:
             return False
         try:
             cov = self.agent.encoder.focus_alignment(
                 focus, [answer_text], reduce="min")[0]
-            return cov < 0.55
+            return cov < bar
+        except AttributeError:
+            return False       # encoder has no word-level meaning (RI)
         except Exception:
-            return False
+            return True        # the check broke: treat as a miss
 
     # ── Analogies: solved by LOOKING UP the dictionary, not guessing ──
     _ANALOGY_RE = re.compile(
@@ -1594,7 +1625,7 @@ class FluentTelp:
                 return None
             # the relationship, transported: gloss(B) with A swapped for C
             target = re.sub(rf"\b{a}s?\b", c, gloss_b.lower())
-            con = _sq.connect(str(_TELP_ROOT / "state" / "wiktionary" / "dict.db"))
+            con = _sq.connect(str(state_path("wiktionary", "dict.db")))
             # candidates must share the RELATION's key words, not just mention C
             keywords = [w for w in re.findall(r"[a-z]{5,}", gloss_b.lower())
                         if w not in (a, b) and w != c][:3]
@@ -1786,9 +1817,7 @@ class FluentTelp:
             return []
         claims = []
         for h in hits:
-            if str(h.get("source", "")).startswith(
-                    ("user_msg", "agent_response", "conversation_turn",
-                     "image:", "video:")):
+            if str(h.get("source", "")).startswith(_NOT_FACT_SOURCES):
                 continue
             tl = h["text"].lower()
             if role.lower() not in tl or ekey not in tl:
@@ -1977,9 +2006,23 @@ class FluentTelp:
         return essay
 
     # ── Stories: dispatch to the REAL imagination engine, not n-gram babble ──
+    # the article must be followed by whitespace: "(?:a|an|the)?\s*" let "a"
+    # match the start of "an owl", leaving the hero named "n"
     _STORY_RE = re.compile(
         r"\b(?:tell|make\s+up|write|imagine|invent|dream\s+up)\b.{0,24}?\bstory\b"
-        r"(?:.{0,20}?\babout\s+(?:a|an|the)?\s*([a-zA-Z][a-zA-Z ]{2,24}))?", re.I)
+        r"(?:.{0,20}?\babout\s+(?:(?:a|an|the|some|my)\s+)?"
+        r"([a-zA-Z][a-zA-Z ]{1,40}))?", re.I)
+    _STORY_STOP = re.compile(
+        r"\s+(?:who|that|which|and|with|in|on|at|from|named|called|for)\b.*$",
+        re.I)
+
+    @classmethod
+    def _story_seed(cls, phrase: str | None) -> str | None:
+        """'purple elephant who loves jam' -> 'elephant' (the head noun)."""
+        if not phrase:
+            return None
+        words = cls._STORY_STOP.sub("", phrase.strip()).split()
+        return words[-1].lower() if words else None
 
     def _story_route(self, user_msg: str, emotion) -> str | None:
         q = user_msg.lower()
@@ -2019,7 +2062,7 @@ class FluentTelp:
                 print("[fluency] waking the imagination engine ...", flush=True)
                 self._imagination = ImaginationEngine(seed=None)
             eng = self._imagination
-            seed = (m.group(1) or "").strip().split()[0].lower() if m.group(1) else None
+            seed = self._story_seed(m.group(1))
             if not seed:
                 import random
                 seed = random.choice(eng.cast_pool())
@@ -2163,7 +2206,7 @@ class FluentTelp:
         if not hasattr(self, "_persona_emb"):
             import sqlite3 as _sq
             import numpy as _np
-            con = _sq.connect(str(_TELP_ROOT / "state" / "persona.db"))
+            con = _sq.connect(str(self.persona.db_path))
             texts = [r[0] for r in con.execute(
                 "SELECT text FROM persona_facts").fetchall()]
             con.close()
@@ -2222,6 +2265,15 @@ class FluentTelp:
                 body = self._forget_semantic(target)
         except Exception:
             return None
+        # forgetting must take effect NOW, in this process too: reload the
+        # memory stack and rebuild the claims extracted from it (deleted
+        # rows used to keep answering through the claim store until restart)
+        try:
+            if self.agent.lattice.changed_on_disk():
+                self.agent.lattice._reload_from_disk()
+            self.agent._rebuild_structured_qa()
+        except Exception:
+            pass
         shaped = self.voice.shape_response(body, band="high", emotion=emotion)
         self.agent.turns.append({
             "user": user_msg, "agent": shaped, "retrieved_memories": [],
@@ -2312,13 +2364,22 @@ class FluentTelp:
                 f"I will.")
 
     # ── Provenance route: "how do you know?" cites the actual sources ──
-    _PROV_TRIGGERS = ("how do you know", "where did you learn", "your source",
-                      "why do you say", "prove it", "where did that come from",
-                      "how did you learn")
+    # The WHOLE message must ask where the last answer came from. A
+    # substring test sent "how do you know if an egg is bad" here.
+    _PROV_RX = re.compile(
+        r"^\W*(?:(?:and|but|ok|okay|so|wait|hm+)[,\s]+)*(?:"
+        r"how\s+(?:do|did|would)\s+you\s+know(?:\s+(?:that|this|it|so|about\s+that))?"
+        r"|(?:where|how)\s+did\s+you\s+(?:learn|get|hear|read|find)\s+(?:that|this|it)"
+        r"|what(?:'s|\s+is|\s+was)\s+your\s+source(?:\s+for\s+(?:that|this|it))?"
+        r"|(?:cite|show\s+me|give\s+me)\s+your\s+sources?"
+        r"|your\s+sources?|sources?"
+        r"|why\s+do\s+you\s+(?:say|think)\s+(?:that|this|so)"
+        r"|prove\s+it|where\s+did\s+that\s+come\s+from"
+        r")\W*$", re.I)
 
     def _provenance_route(self, user_msg: str, emotion) -> str | None:
         q = user_msg.lower()
-        if not any(t in q for t in self._PROV_TRIGGERS):
+        if not self._PROV_RX.match(q.strip()):
             return None
 
         def _say(body: str) -> str:
@@ -2378,7 +2439,9 @@ class FluentTelp:
 
     def _vision_route(self, user_msg: str, emotion) -> str | None:
         q = user_msg.lower()
-        if not any(w in q.split() or w in q for w in self._VISION_WORDS):
+        # whole words only: "photosynthesis" contains "photo", "seesaw"
+        # contains "see" - neither is a question about Telp's sight
+        if not re.search(r"\b(?:" + "|".join(self._VISION_WORDS) + r")s?\b", q):
             return None
         # only questions about TELP's own seeing - "my video looks blurry"
         # is the user's problem, not a sight-memory query
@@ -2510,8 +2573,7 @@ class FluentTelp:
             return None
         hits = [h for h in hits
                 if not str(h.get("source", "")).startswith(
-                    ("user_msg", "agent_response", "conversation_turn",
-                     "image:", "video:"))][:14]
+                    _NOT_FACT_SOURCES)][:14]
         if not hits:
             return None
         top_sim = float(hits[0].get("similarity", 0.0))
@@ -2620,7 +2682,7 @@ class FluentTelp:
                 if cov < bar:
                     return None            # uncovered facet -> honest miss
             except Exception:
-                pass
+                return None                # a gate that errors fails CLOSED
         # NEGATION IS A FACET the embedding cannot see: "what do raccoons
         # NOT eat?" retrieves the same rows as the positive question. A
         # positive fact must never be served as if it answered the negative
@@ -3234,8 +3296,7 @@ class FluentTelp:
                     hits = self.agent.lattice.query(topic, k=24)
                     hits = [h for h in hits
                             if not str(h.get("source", "")).startswith(
-                                ("user_msg", "agent_response",
-                                 "conversation_turn", "image:", "video:"))]
+                                _NOT_FACT_SOURCES)]
                     if hits and float(hits[0].get("similarity", 0)) >= 0.30:
                         from mind.composer import simplify
                         fact = simplify(hits[0]["text"])
@@ -3329,7 +3390,7 @@ class FluentTelp:
         # overlap to surface the consensus answer.
         md = self._multidoc_synthesize(user_msg, top_k=12)
         if (md is not None and md["band"] in ("high", "med")
-                and not self._howto_miss(user_msg, md.get("text", ""))):
+                and not self._facet_miss(user_msg, md.get("text", ""))):
             # Apply voice shaping (emotion + band) instead of the
             # legacy hedge — gives Telp personality through this path
             # too.
@@ -3345,7 +3406,7 @@ class FluentTelp:
             self.agent.turns.append({
                 "user":               user_msg,
                 "agent":              body,
-                "retrieved_memories": [s["source"] for s in md["sources"]],
+                "retrieved_memories": [s["text"] for s in md["sources"]],
                 "similarity":         md["sources"][0]["sim"] if md["sources"] else 0.0,
                 "domain":             "multidoc",
                 "n_sources":          md["n_sources"],
@@ -3368,9 +3429,10 @@ class FluentTelp:
         last_turn = self.agent.turns[-1] if self.agent.turns else {}
         band = _confidence_band(last_turn)
 
-        # procedural questions: if even the fallback answer doesn't cover the
-        # HOW (boil), it's a miss - trigger the lookup instead of settling
-        force_miss = self._howto_miss(user_msg, raw)
+        # if even the fallback answer doesn't cover what was asked (the HOW
+        # of "boil", the WHO of "invented"), it's a miss - trigger the
+        # lookup instead of settling
+        force_miss = self._facet_miss(user_msg, raw)
 
         if _looks_like_abstention(raw) or band == "none" or force_miss:
             # LEARN-ON-MISS (2026-07-02): before giving up, go find it -
@@ -3424,46 +3486,21 @@ class FluentTelp:
             return body
         c = max(0.0, min(1.0, creativity))
 
-        # Direct: take only the first sentence — most essential statement
+        # Direct: take only the first sentence — most essential statement.
+        # Bracketed notes ride along: "(Careful - my memories disagree...)"
+        # is the one sentence a terse answer must never drop.
         if c < 0.25:
             sents = _split_sentences(body)
             if sents:
-                return _normalize(sents[0])
+                # notes are appended last and may span sentences
+                note_at = next((i for i, x in enumerate(sents)
+                                if i and x.lstrip().startswith("(")), None)
+                keep = [sents[0]] + (sents[note_at:] if note_at else [])
+                return _normalize(" ".join(keep))
             return body
 
-        # Synthesized: default — return composed body as-is
-        if c < 0.50:
-            return body
-
-        # Extrapolated / imagined: extend via the agent's HDC generator
-        # using the tail of the body as the seed.  More creativity ->
-        # longer continuation, looser repetition penalty.
-        try:
-            seq = getattr(self.agent, "seq", None)
-            if seq is None or not hasattr(seq, "generate"):
-                return body
-            # Seed = last 5-8 words of the current body
-            seed_words = body.rstrip(".!?").strip().split()[-7:]
-            seed = " ".join(seed_words)
-            if not seed:
-                return body
-            # Scale: 8-32 extra words from creativity 0.5 to 1.0
-            n_words = int(8 + (c - 0.5) * 48)
-            if hasattr(self.agent, "ensure_generator"):
-                self.agent.ensure_generator()
-            ext = seq.generate(seed, n_words=n_words)
-            if not ext:
-                return body
-            # The generator returns "seed + generated tokens" as one
-            # string; strip the seed so we only append the new part.
-            tail = ext[len(seed):].strip() if ext.startswith(seed) else ext
-            if not tail:
-                return body
-            # Light cleanup: capitalize, trim repeated dangling words
-            tail = _normalize(tail).rstrip(",;")
-            # Avoid the extension ending mid-thought
-            if tail and tail[-1] not in ".!?":
-                tail = tail.rstrip(",") + "."
-            return body.rstrip() + " " + tail
-        except Exception:
-            return body
+        # Synthesized and above: the composed body as-is. Higher settings
+        # used to append n-gram continuations ("...founded before 27 bc by
+        # augustus the atr and bollinger bands") - words no memory backs.
+        # Factual answers stay citable; invention is the story engine's job.
+        return body

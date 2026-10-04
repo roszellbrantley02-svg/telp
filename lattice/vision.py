@@ -34,7 +34,8 @@ os.environ.setdefault("HF_HOME", _cache)
 _TELP_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_TELP_ROOT))
 
-CHAT_LATTICE = _TELP_ROOT / "state" / "concept_bridge.db"
+from lattice.paths import MEMORY_DB, state_path  # noqa: E402
+CHAT_LATTICE = MEMORY_DB   # the one memory chat also uses
 
 # Visual vocabulary: the big curated list (~900 concepts). Falls back to the
 # small inline list below if the vocab module is missing.
@@ -158,14 +159,27 @@ def see(agent, image_path, namer: ZeroShotNamer | None = None):
             "text": lines}
 
 
+def _read_memories(db, sql: str, params: tuple = ()) -> list[tuple]:
+    """Read-only query against a memory file. A missing file or table means
+    nothing remembered yet - never create an empty file as a side effect
+    (an empty concept_bridge.db used to be enough to orphan chat's memory)."""
+    import sqlite3
+    if not Path(db).exists():
+        return []
+    con = sqlite3.connect(f"file:{Path(db).as_posix()}?mode=ro", uri=True)
+    try:
+        return con.execute(sql, params).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        con.close()
+
+
 def sights(db) -> list[dict]:
     """All image-sourced memories in a lattice - a targeted scan, so sights are
     retrievable no matter how many text memories surround them."""
-    import sqlite3
-    con = sqlite3.connect(str(db))
-    rows = con.execute("SELECT created_at, text, source FROM memories "
-                       "WHERE source LIKE 'image:%' ORDER BY id").fetchall()
-    con.close()
+    rows = _read_memories(db, "SELECT created_at, text, source FROM memories "
+                              "WHERE source LIKE 'image:%' ORDER BY id")
     return [{"when": r[0], "caption": r[1],
              "path": r[2].split(":", 1)[1]} for r in rows]
 
@@ -200,24 +214,38 @@ def recall_semantic(db, query: str, namer: ZeroShotNamer | None = None, k: int =
 
 # ─── Watching: video -> scene memories ──────────────────────────────
 
-SIGHTS_DIR = _TELP_ROOT / "state" / "sights"
+SIGHTS_DIR = state_path("sights")
 
 
 def _ffmpeg():
+    """ffmpeg: $TELP_FFMPEG_DIR first (as documented), then PATH."""
+    import os
     import shutil
+    d = os.environ.get("TELP_FFMPEG_DIR")
+    if d:
+        for name in ("ffmpeg", "ffmpeg.exe"):
+            if (Path(d) / name).exists():
+                return str(Path(d) / name)
     p = shutil.which("ffmpeg")
     if p:
         return p
     import glob as _g
     for c in _g.glob(r"C:\Users\*\upscaler\bin\**\ffmpeg.exe", recursive=True):
         return str(c)
-    raise RuntimeError("ffmpeg not found")
+    raise RuntimeError("ffmpeg not found - install it or set TELP_FFMPEG_DIR")
+
+
+def _ffprobe():
+    """ffprobe from the same folder as ffmpeg when it's there."""
+    import shutil
+    ff = Path(_ffmpeg())
+    sib = ff.with_name("ffprobe" + ff.suffix)
+    return str(sib) if sib.exists() else (shutil.which("ffprobe") or "ffprobe")
 
 
 def _probe_wh(video):
     import subprocess, json
-    ff = _ffmpeg()
-    fp = ff[:-len("ffmpeg.exe")] + "ffprobe.exe" if ff.endswith("ffmpeg.exe") else "ffprobe"
+    fp = _ffprobe()
     r = subprocess.run([fp, "-v", "error", "-select_streams", "v:0",
                         "-show_entries", "stream=width,height", "-of", "json", str(video)],
                        capture_output=True, text=True)
@@ -315,21 +343,16 @@ def watch(agent, video_path, sample_fps=4.0, cut_thresh=22.0, every_s=10.0,
 
 def screen_texts(db) -> list[dict]:
     """All on-screen text memories (OCR rows) - targeted scan, like sights()."""
-    import sqlite3
-    con = sqlite3.connect(str(db))
-    rows = con.execute("SELECT created_at, text FROM memories WHERE text LIKE "
-                       "'%the screen shows the text%' ORDER BY id").fetchall()
-    con.close()
+    rows = _read_memories(db, "SELECT created_at, text FROM memories WHERE "
+                              "text LIKE '%the screen shows the text%' "
+                              "ORDER BY id")
     return [{"when": r[0], "text": r[1]} for r in rows]
 
 
 def watched(db) -> list[dict]:
     """All watch-summary memories."""
-    import sqlite3
-    con = sqlite3.connect(str(db))
-    rows = con.execute("SELECT created_at, text, source FROM memories "
-                       "WHERE source LIKE 'video:%' ORDER BY id").fetchall()
-    con.close()
+    rows = _read_memories(db, "SELECT created_at, text, source FROM memories "
+                              "WHERE source LIKE 'video:%' ORDER BY id")
     return [{"when": r[0], "summary": r[1], "path": r[2].split(":", 1)[1]}
             for r in rows]
 
@@ -363,6 +386,33 @@ def forget(db, *, video: str | None = None, query: str | None = None,
             "(source LIKE 'video:%' AND source LIKE ?) OR "
             "(source LIKE 'image:%' AND text LIKE ?)",
             (f"%{stem}%", f"%in video '{stem}'%")).fetchall()
+        if stem.startswith("youtube:"):
+            # a YouTube watch files rows under its TITLE (scenes, on-screen
+            # text, transcript) as well as its id - forgetting only the
+            # id-tagged summary left all of those behind
+            vid = stem.split(":", 1)[1]
+            titles = set()
+            for (text,) in con.execute(
+                    "SELECT text FROM memories WHERE source=?",
+                    (f"video:youtube:{vid}",)):
+                m = re.search(r"YouTube video '(.+?)':", text)
+                if m:
+                    titles.add(m.group(1))
+            for t in {*titles, *(re.sub(r"[^A-Za-z0-9_\- ]", "", t)[:40]
+                                 .strip() for t in titles)}:
+                if not t:
+                    continue
+                rows += con.execute(
+                    "SELECT id, text, source FROM memories WHERE "
+                    "(source LIKE 'image:%' AND text LIKE ?) OR source=? "
+                    "OR (source LIKE 'youtube:%' AND text LIKE ?)",
+                    (f"%in video '{t}'%", f"video:{t}",
+                     f"%video '{t}'%")).fetchall()
+            rows += con.execute(
+                "SELECT id, text, source FROM memories WHERE source=? "
+                "OR (source LIKE 'video:%' AND source LIKE ?)",
+                (f"youtube:{vid}", f"%{vid}%")).fetchall()
+            rows = list({r[0]: r for r in rows}.values())
     elif query:
         for h in recall_semantic(db, query, k=1):
             if h["similarity"] < min_sim:

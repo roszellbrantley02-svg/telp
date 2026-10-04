@@ -25,7 +25,10 @@ from functools import lru_cache
 from pathlib import Path
 
 _TELP_ROOT = Path(__file__).resolve().parents[1]
-_DICT_DB = _TELP_ROOT / "state" / "wiktionary" / "dict.db"
+if str(_TELP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TELP_ROOT))
+from lattice.paths import state_path  # noqa: E402
+_DICT_DB = state_path("wiktionary", "dict.db")
 
 _BAD_TAGS = ("archaic", "obsolete", "dated", "rare", "poetic", "dialect",
              "slang", "vulgar", "informal", "humorous")
@@ -135,9 +138,13 @@ def _apply_splits(sent: str) -> tuple[str, int]:
     return sent, n
 
 
-def restyle(sent: str, emb_fn, min_cos: float = 0.92) -> tuple[str, int]:
-    """Restyle one sentence. Returns (text, n_transforms). On round-trip
-    failure every transform reverts and the original stands."""
+def restyle(sent: str, emb_fn, min_cos: float = 0.92,
+            original: str | None = None) -> tuple[str, int]:
+    """Restyle one sentence. Returns (text, n_transforms). The rewording is
+    compared with `original` (the stored memory, when the caller has
+    already simplified it) - not just with its own input - and on drift
+    every transform reverts. This is an embedding-similarity check, a
+    guard against drift, not a proof that meaning is preserved."""
     try:
         cand, swaps = _apply_swaps(sent)
         cand, n_split = _apply_splits(cand)
@@ -145,7 +152,8 @@ def restyle(sent: str, emb_fn, min_cos: float = 0.92) -> tuple[str, int]:
         if n == 0 or cand == sent:
             return sent, 0
         import numpy as np
-        e = np.asarray(emb_fn([sent, cand]))
+        ref = original or sent
+        e = np.asarray(emb_fn([ref, cand]))
         if float(e[0] @ e[1]) < min_cos:
             return sent, 0                  # meaning drifted: revert
         return cand, n

@@ -13,6 +13,7 @@ attribute access, names, etc.
 from __future__ import annotations
 
 import ast
+import math
 import operator
 import re
 from dataclasses import dataclass
@@ -25,6 +26,20 @@ class ArithResult:
     explain:    str
 
 
+MAX_RESULT_DIGITS = 1000
+
+
+def safe_pow(base, exp):
+    """`**` that refuses results too big to compute or print. 9**9**9 used
+    to spin forever (freezing the single-threaded daemon for everyone) and
+    2**20000 blew Python's 4300-digit int->str limit."""
+    if (isinstance(base, (int, float)) and isinstance(exp, (int, float))
+            and abs(base) > 1 and exp > 0
+            and exp * math.log10(abs(base)) > MAX_RESULT_DIGITS):
+        raise ValueError("result too large")
+    return operator.pow(base, exp)
+
+
 _OPS = {
     ast.Add:      operator.add,
     ast.Sub:      operator.sub,
@@ -32,7 +47,7 @@ _OPS = {
     ast.Div:      operator.truediv,
     ast.FloorDiv: operator.floordiv,
     ast.Mod:      operator.mod,
-    ast.Pow:      operator.pow,
+    ast.Pow:      safe_pow,
     ast.USub:     operator.neg,
     ast.UAdd:     operator.pos,
 }
@@ -103,12 +118,13 @@ def detect_and_eval(query: str) -> ArithResult | None:
         return None
     try:
         value = safe_eval(s)
-    except (ValueError, ZeroDivisionError, SyntaxError) as e:
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        explain = f"{s.strip()} = {value}"
+    except (ValueError, ZeroDivisionError, SyntaxError, OverflowError):
         return None
-    if isinstance(value, float) and value.is_integer():
-        value = int(value)
     return ArithResult(
         expression=s,
         value=value,
-        explain=f"{s.strip()} = {value}",
+        explain=explain,
     )
