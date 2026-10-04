@@ -25,6 +25,15 @@
 !train/
 !train/v5_hdc_prototype.py
 
+# the test suite + CI
+!tests/
+!tests/*.py
+!pytest.ini
+!requirements-dev.txt
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
+
 # the imagination lane drivers
 !tools/
 !tools/dream.py

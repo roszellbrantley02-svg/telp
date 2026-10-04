@@ -1,0 +1,7 @@
+# What the test suite needs. It runs fully offline: the MiniLM sentence
+# model is replaced by tests/fake_minilm.py, so no torch, no model
+# downloads, no network.
+numpy
+scipy
+Pillow
+pytest
