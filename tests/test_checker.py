@@ -298,6 +298,62 @@ def test_claims_without_sources_are_unsupported():
                 evidence=[]).note == "there were no sources to check it against"
 
 
+# ─── births and deaths ──────────────────────────────────────────────
+
+LIVES = [
+    Evidence(1, "Galileo di Vincenzo Bonaiuti de' Galilei (15 February 1564 "
+                "– 8 January 1642) was an Italian astronomer, physicist and "
+                "engineer.", "wikipedia:Galileo Galilei", "2026-07-02"),
+    Evidence(2, "Galileo Galilei was born in Pisa on 15 February 1564 and "
+                "died on 8 January 1642 in Arcetri.",
+             "wikipedia:Galileo Galilei", "2026-07-02"),
+    Evidence(3, "age from 1564-02-15 to 1642-01-08 = 77 years",
+             "tool:date_diff", kind="tool"),
+]
+
+
+@pytest.mark.parametrize("sentence", [
+    "Galileo was born in 1564 [1].",
+    "Galileo died in 1642 [1].",
+    "Galileo lived from 1564 to 1642 [1].",
+    "Galileo's death came in 1642 [1].",
+    "Born in 1564, Galileo died in 1642 [2].",
+    "Galileo died on 8 January 1642 [2].",
+    "Galileo Galilei was born on 15 February 1564 [1] and died on 8 January "
+    "1642 [1], so he was 77 years old when he died [3].",
+])
+def test_a_bracketed_lifespan_says_born_and_died(sentence):
+    check = _one(sentence, evidence=LIVES)
+    assert check.status == "supported", check.note
+
+
+@pytest.mark.parametrize("sentence, note", [
+    ("Galileo was born in 1642 [1].", "[1] gives 1642 as a death, not a birth"),
+    ("Galileo died in 1564 [1].", "[1] gives 1564 as a birth, not a death"),
+    ("Galileo's birth was in 1642 [1].", "as a death, not a birth"),
+    ("Galileo was born on 8 January 1642 [2].",
+     "[2] gives 8 January 1642 as a death, not a birth"),
+    ("Galileo died on 15 February 1564 [2].", "as a birth, not a death"),
+    ("Galileo was born in 1642.", "the closest source gives 1642 as a death"),
+])
+def test_swapped_birth_and_death_years_are_caught(sentence, note):
+    check = _one(sentence, evidence=LIVES)
+    assert check.status == "unsupported"
+    assert note in check.note
+
+
+def test_reporting_conflicting_sources_is_a_checked_claim():
+    ev = [Evidence(1, "There are 95 known moons of Jupiter as of February "
+                      "2023.", "wikipedia:Moons of Jupiter", "2026-07-05"),
+          Evidence(2, "Jupiter has 115 moons.", "user_taught", "2026-09-01")]
+    good = ("My sources disagree: Wikipedia lists 95 known moons as of "
+            "February 2023 [1], while you told me Jupiter has 115 moons [2].")
+    assert _one(good, evidence=ev).status == "supported"
+    swapped = ("My sources disagree: Wikipedia lists 115 known moons as of "
+               "February 2023 [1], while you told me Jupiter has 95 moons [2].")
+    assert _one(swapped, evidence=ev).status == "unsupported"
+
+
 # ─── several citations on one sentence ──────────────────────────────
 
 @pytest.mark.parametrize("cites", ["[2][3]", "[2, 3]", "[2,3]", "[2-3]",

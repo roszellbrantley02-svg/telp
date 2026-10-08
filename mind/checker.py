@@ -24,8 +24,12 @@ answer every sentence is checked here - by plain rules, no language model:
         ("discovered" finds "discovery"), or close in meaning when an
         encoder is given (encoder.focus_alignment)
       - a "not" the source doesn't have - or a source's "not" the
-        sentence dropped - fails it
-    A citation to a source Telp never supplied fails the sentence.
+        sentence dropped - fails it, and so does a year the sentence gives
+        as a birth that the source gives as a death (or the reverse)
+    A citation to a source Telp never supplied fails the sentence. When
+    one sentence cites several sources, every number and name must come
+    from a source about the same thing, and from the source cited right
+    after it - so facts can't be mixed across sources into a new one.
   * annotate() gives what the user sees: unverified sentences marked, then
     the list of sources actually used. summarize() gives the counts.
 
@@ -631,6 +635,7 @@ class _Key:
     pos: int                # token position in the sentence
     group: int = 0          # names: which name ("Galileo Galilei" = one)
     forms: frozenset = frozenset()
+    role: str | None = None     # numbers/dates: born | died, if the sentence says
 
 
 @dataclass
@@ -772,6 +777,87 @@ def _word_numbers(toks: list[_Tok], used: list[bool],
     return out
 
 
+@dataclass(slots=True)
+class _Occ:
+    """One number or date found in a text."""
+    kind: str                       # number | date
+    value: object                   # Decimal | [(y, m, d)...]
+    unscaled: Decimal | None        # 13.8 for "13.8 billion"
+    i0: int                         # its tokens: [i0, i1)
+    i1: int
+    start: int                      # its characters
+    end: int
+    role: str | None = None         # born | died: what it is the date of
+
+
+# "Galileo Galilei (15 February 1564 - 8 January 1642) was..." - how
+# encyclopedias say born / died without the words
+_LIFESPAN = re.compile(r"\(([^()]*?\d{3,4}\s*(?:bce?|ad|ce)?)\s*(?:-|to|until)"
+                       r"\s*([^()]*?\d{3,4}[^()]*)\)", re.I)
+_LIFE_ROLES = {"born": "born", "die": "died"}       # stem -> role
+_LIFE_STEMS = frozenset(_stem(w) for w in ("born", "die", "live"))
+
+
+def _life_roles(occs: list[_Occ], toks: list[_Tok], text: str) -> None:
+    """Mark each number or date as a birth or a death when the text says
+    so: the nearest 'born' / 'died' before it (or else after it), with no
+    other number in between - 'born in 1564 and died in 1642' - or its
+    half of a bracketed lifespan. Lets the checker catch a model that
+    swaps the two years."""
+    life = {i: _LIFE_ROLES[st] for i, t in enumerate(toks)
+            if (st := _stem(t.base)) in _LIFE_ROLES}
+    if life:
+        taken = {k for o in occs for k in range(o.i0, o.i1)}
+
+        def nearest(positions: range) -> str | None:
+            for j in positions:
+                if j < 0 or j >= len(toks) or j in taken:
+                    return None         # another number in between
+                if j in life:
+                    return life[j]
+            return None
+
+        for o in occs:
+            o.role = (nearest(range(o.i0 - 1, o.i0 - 1 - WINDOW, -1))
+                      or nearest(range(o.i1, o.i1 + WINDOW)))
+    for m in _LIFESPAN.finditer(text):
+        for o in occs:
+            if m.start(1) <= o.start < m.end(1):
+                o.role = "born"
+            elif m.start(2) <= o.start < m.end(2):
+                o.role = "died"
+
+
+def _numerics(text: str, toks: list[_Tok], used: list[bool]) -> list[_Occ]:
+    """Every date and number in the text, in order; their tokens are
+    marked used so they aren't read again as words."""
+    low = _lower(text)
+    starts = [t.start for t in toks]
+
+    def span(s: int, e: int) -> tuple[int, int]:
+        i0 = i1 = bisect_left(starts, s)
+        while i1 < len(toks) and toks[i1].start < e:
+            i1 += 1
+        return i0, i1
+
+    occs: list[_Occ] = []
+    chars = list(low)
+    for alts, s, e in _find_dates(low):
+        occs.append(_Occ("date", alts, None, *span(s, e), s, e))
+        chars[s:e] = " " * (e - s)
+    for value, unscaled, s, e in _find_numbers("".join(chars)):
+        occs.append(_Occ("number", value, unscaled, *span(s, e), s, e))
+    for o in occs:
+        for k in range(o.i0, o.i1):
+            used[k] = True
+    for value, i0, i1 in _word_numbers(toks, used, text):
+        occs.append(_Occ("number", value, None, i0, i1, toks[i0].start,
+                         toks[i1 - 1].end))
+    occs.sort(key=lambda o: o.i0)
+    _life_roles(occs, toks, text)
+    return occs
+
+
 def _is_name(t: _Tok, i: int, text: str, vocab: set[str]) -> bool:
     """A capitalized word that names something. The first word of a
     sentence is a name only when it isn't a common word: 'Bananas are...'
@@ -823,32 +909,10 @@ def _parse_claim(text: str, vocab: set[str]) -> _Claim:
     """Pull out what a source must contain for this sentence to stand:
     its numbers, dates and names (strict) and its other words (soft)."""
     toks = _tokens(text)
-    low = _lower(text)
-    starts = [t.start for t in toks]
     used = [False] * len(toks)
-    keys: list[_Key] = []
-
-    def at(pos: int) -> int:
-        return max(0, min(len(toks) - 1, bisect_left(starts, pos)))
-
-    def consume(s: int, e: int) -> None:
-        for k in range(bisect_left(starts, s), len(toks)):
-            if toks[k].start >= e:
-                break
-            used[k] = True
-
-    chars = list(low)
-    for alts, s, e in _find_dates(low):
-        keys.append(_Key("date", alts, text[s:e].strip(" ,."), at(s)))
-        consume(s, e)
-        chars[s:e] = " " * (e - s)
-    masked = "".join(chars)
-    for value, _unscaled, s, e in _find_numbers(masked):
-        keys.append(_Key("number", value, text[s:e].strip(), at(s)))
-        consume(s, e)
-    for value, i0, i1 in _word_numbers(toks, used, text):
-        keys.append(_Key("number", value,
-                         text[toks[i0].start:toks[i1 - 1].end], i0))
+    keys = [_Key(o.kind, o.value, text[o.start:o.end].strip(" ,."), o.i0,
+                 role=o.role)
+            for o in _numerics(text, toks, used)]
 
     words: list[tuple[str, float, str, int]] = []
     names: set[str] = set()
@@ -906,25 +970,30 @@ class _Item:
     md: set[tuple] = field(default_factory=set)
     neg_follow: set[str] = field(default_factory=set)
     lower: set[str] = field(default_factory=set)
+    roles: dict[tuple, set] = field(default_factory=dict)  # value -> born/died/None
 
 
-# "Galileo Galilei (15 February 1564 - 8 January 1642) was..." - how
-# encyclopedias say born / died / lived without the words
-_LIFESPAN = re.compile(r"\([^()]*?\d{3,4}\s*(?:bce?|ad|ce)?\s*(?:-|to|until)"
-                       r"\s*[^()]*?\d{3,4}[^()]*\)", re.I)
-_LIFE_STEMS = frozenset(_stem(w) for w in ("born", "die", "live"))
-
-
-def _add_date(it: _Item, y, m, d, as_numbers: bool = True) -> None:
+def _add_date(it: _Item, y, m, d, as_numbers: bool = True,
+              role: str | None = None) -> None:
+    """File a date under every reading a sentence may use: the full date,
+    month and year, day and month, the year alone (and the day)."""
+    readings = []
     if y is not None and d is not None:
         it.ymd.add((y, m, d))
+        readings.append(("ymd", (y, m, d)))
     if y is not None:
         it.ym.add((y, m))
         it.numbers.add(Decimal(y))
+        readings += [("ym", (y, m)), ("n", Decimal(y))]
     if d is not None:
         it.md.add((m, d))
+        readings.append(("md", (m, d)))
         if as_numbers:
             it.numbers.add(Decimal(d))
+            readings.append(("n", Decimal(d)))
+    if as_numbers:                      # created_at dates have no story
+        for r in readings:
+            it.roles.setdefault(r, set()).add(role)
 
 
 def _index_item(ev: Evidence) -> _Item:
@@ -937,28 +1006,15 @@ def _index_item(ev: Evidence) -> _Item:
     it = _Item(ev=ev, text=ev.text or "", tool=(ev.kind == "tool"
                                                or (ev.source or "").startswith("tool:")))
     toks = _tokens(full)
-    used = [False] * len(toks)
-    low = _lower(full)
-    chars = list(low)
-    starts = [t.start for t in toks]
-    for alts, s, e in _find_dates(low):
-        for y, m, d in alts:
-            _add_date(it, y, m, d)
-        chars[s:e] = " " * (e - s)
-        for k in range(bisect_left(starts, s), len(toks)):
-            if toks[k].start >= e:
-                break
-            used[k] = True
-    for value, unscaled, s, e in _find_numbers("".join(chars)):
-        it.numbers.add(value)
-        if unscaled is not None:
-            it.numbers.add(unscaled)
-        for k in range(bisect_left(starts, s), len(toks)):
-            if toks[k].start >= e:
-                break
-            used[k] = True
-    for value, _i0, _i1 in _word_numbers(toks, used, full):
-        it.numbers.add(value)
+    for o in _numerics(full, toks, [False] * len(toks)):
+        if o.kind == "date":
+            for y, m, d in o.value:
+                _add_date(it, y, m, d, role=o.role)
+        else:
+            for v in (o.value, o.unscaled):
+                if v is not None:
+                    it.numbers.add(v)
+                    it.roles.setdefault(("n", v), set()).add(o.role)
     if ev.created_at:                   # "saved 2026-07-02" is shown to the model
         m = re.match(r"(\d{4})-(\d{2})-(\d{2})", ev.created_at)
         if m and _valid(int(m.group(1)), int(m.group(2)), int(m.group(3))):
@@ -1050,8 +1106,40 @@ class _Verdict:
     score: float
     missing_keys: list[str]
     missing_words: list[str]
-    problem: str = ""           # negation | mixed
+    problem: str = ""           # negation | role | mixed
     anchors: int = 0            # keys found + informative words matched
+    swapped: list[tuple[str, str]] = field(default_factory=list)
+
+
+def _key_roles(k: _Key, it: _Item) -> set:
+    """What the source says a number or date is the date of."""
+    if k.kind == "number":
+        return it.roles.get(("n", k.value), set())
+    out: set = set()
+    for y, m, d in k.value:
+        if y is not None and d is not None:
+            out |= it.roles.get(("ymd", (y, m, d)), set())
+        elif y is not None:
+            out |= it.roles.get(("ym", (y, m)), set())
+        else:
+            out |= it.roles.get(("md", (m, d)), set())
+    return out
+
+
+def _role_swaps(claim: _Claim, items: list[_Item]) -> list[tuple[str, str]]:
+    """Years the sentence gives as a birth that its sources give only as
+    a death, or the other way round: 'born in 1642' against
+    '(15 February 1564 - 8 January 1642)'."""
+    out = []
+    for k in claim.keys:
+        if k.role and k.kind in ("number", "date"):
+            seen: set = set()
+            for it in items:
+                if _key_in(k, it):
+                    seen |= _key_roles(k, it)
+            if seen == {"died" if k.role == "born" else "born"}:
+                out.append((k.label, k.role))
+    return out
 
 
 def _negation_clash(claim: _Claim, items: list[_Item]) -> bool:
@@ -1129,12 +1217,16 @@ def _judge(claim: _Claim, items: list[_Item], aligner: _Aligner,
     ok = (not missing_keys and overlap >= MIN_OVERLAP
           and len(misses) <= informative // MISS_EVERY)
     problem = ""
+    swapped = _role_swaps(claim, items) if ok else []
     if ok and _negation_clash(claim, items):
         ok, problem = False, "negation"
+    elif swapped:
+        ok, problem = False, "role"
     elif ok and len(items) > 1 and not _bound(claim, items, aligner):
         ok, problem = False, "mixed"
     anchors = n_keys - len(missing_keys) + matched
-    return _Verdict(ok, score, missing_keys, misses, problem, anchors)
+    return _Verdict(ok, score, missing_keys, misses, problem, anchors,
+                    swapped)
 
 
 def _best_single(claim: _Claim, items: list[_Item], aligner: _Aligner
@@ -1267,6 +1359,13 @@ def _why_not(v: _Verdict, ns: list[int], cited: bool) -> str:
         return (f"{who} {'say' if plural else 'says'} otherwise "
                 "(a 'not' differs)" if cited else
                 "the closest source says otherwise (a 'not' differs)")
+    if v.problem == "role":
+        label, role = v.swapped[0]
+        said, other = ("birth", "death") if role == "born" else \
+            ("death", "birth")
+        src = who if cited else "the closest source"
+        return (f"{src} {'give' if plural else 'gives'} {label} as a "
+                f"{other}, not a {said}")
     if v.problem == "mixed":
         return (f"mixes details from {who} that no single one of them "
                 "puts together")
@@ -1275,6 +1374,40 @@ def _why_not(v: _Verdict, ns: list[int], cited: bool) -> str:
     if cited:
         return f"{who} {'don' if plural else 'doesn'}'t say this{words}"
     return f"no source says this{words}"
+
+
+def _segments(sentence: str) -> list[tuple[str, list[int]]]:
+    """The sentence cut at its citations: each stretch of text with the
+    citations that follow it ('A [1], while B [2]' -> A:[1], B:[2])."""
+    out, pos = [], 0
+    for m in _CITE_RUN.finditer(sentence):
+        out.append((sentence[pos:m.start()], _parse_cites(m.group(0))))
+        pos = m.end()
+    return out
+
+
+def _misplaced(sentence: str, index: _Index, vocab: set[str]) -> str:
+    """When a sentence cites different sources in different places, each
+    part's numbers, dates and names must be in the sources cited right
+    after it: 'Wikipedia lists 115 moons [1], while you told me 95 [2]'
+    fails when [1] says 95 and [2] says 115. Returns a note, or ''."""
+    parts = [(seg, [index.by_n[c] for c in cites if c in index.by_n])
+             for seg, cites in _segments(sentence)]
+    if len({tuple(id(it) for it in items) for _, items in parts}) < 2:
+        return ""
+    for seg, items in parts:
+        body = _fold(_strip_markup(seg))
+        if not items or not body or _ABSTAIN.search(body.lower()):
+            continue
+        claim = _parse_claim(body, vocab)
+        lost = [k.label for k in claim.keys
+                if not any(_key_in(k, it) for it in items)]
+        if lost:
+            ns = [it.ev.n for it in items]
+            verb = "don't" if len(ns) > 1 else "doesn't"
+            return (f"mixes up its sources: {_refs(ns)} {verb} mention "
+                    f"{_join(lost)}")
+    return ""
 
 
 def _check_sentence(sentence: str, kind: str, index: _Index,
@@ -1309,12 +1442,15 @@ def _check_sentence(sentence: str, kind: str, index: _Index,
         elif len(valid) > 1:
             verdict = _judge(claim, valid, aligner)
             best = max(singles, key=lambda s: s[1].score)[0]
-            if verdict.ok:
+            mixed = _misplaced(sentence, index, vocab) if verdict.ok else ""
+            if mixed:
+                note = mixed
+            elif verdict.ok:
                 status = "supported"
                 note = f"backed by {_refs([it.ev.n for it in valid])} together"
         else:
             best, verdict = singles[0]
-        if status != "supported":
+        if status != "supported" and not note:
             note = _why_not(verdict, [it.ev.n for it in valid], cited=True)
             others = [it for it in index.items if it not in valid]
             right, rv = _best_single(claim, others, _Aligner(None))
