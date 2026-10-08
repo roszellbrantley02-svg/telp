@@ -272,15 +272,23 @@ def cmd_stats(_args) -> int:
 
 # ─── harness mode: Telp as memory + worker, a local model as the writer ──
 
-def _harness(args):
-    """A Harness on the one memory, talking to the model server at --url
-    (default: LM Studio, http://localhost:1234/v1, or $TELP_LLM_URL)."""
-    from mind.harness import Harness
+def _llm_client(args):
+    """The connection to the model server at --url (default: LM Studio,
+    http://localhost:1234/v1, or $TELP_LLM_URL). --timeout 0 means wait
+    as long as the server stays alive."""
     from mind.llm_client import LLMClient
-    client = LLMClient(base_url=args.url, model=args.model)
+    timeout = None if args.timeout == 0 else args.timeout
+    return LLMClient(base_url=args.url, model=args.model, timeout=timeout)
+
+
+def _harness(args):
+    """A Harness on the one memory, talking to the model server."""
+    from mind.harness import Harness
+    client = _llm_client(args)
     return Harness(_fluent(), client, budget_tokens=args.budget,
                    check=not args.no_check, session=args.session,
-                   thinking=False if args.no_think else None)
+                   thinking=False if args.no_think else None,
+                   reply_tokens=args.max_tokens)
 
 
 def _llm_turn(h, text: str, stream: bool):
@@ -382,12 +390,18 @@ def cmd_llm_chat(args) -> int:
 
 def cmd_llm_status(args) -> int:
     """Is the model server up, which model, how much context."""
-    from mind.harness import status_lines
-    from mind.llm_client import LLMClient
-    info = LLMClient(base_url=args.url, model=args.model).status()
+    from mind.harness import failure_kind, status_lines
+    try:
+        info = _llm_client(args).status()
+    except ValueError as e:                   # e.g. a malformed --url
+        print(f"[llm-status] {e}")
+        return 2
     for line in status_lines(info, budget_tokens=args.budget):
         print(line)
-    return 0 if info["reachable"] else 1
+    if info["reachable"]:
+        return 0
+    # a wrong address is the caller's mistake (2), not a server that is down
+    return 2 if failure_kind(info.get("error", "")) == "address" else 1
 
 
 def _llm_flags(sp, full: bool = True) -> None:
@@ -398,8 +412,15 @@ def _llm_flags(sp, full: bool = True) -> None:
                     help="model id (default: the one the server has loaded)")
     sp.add_argument("--budget", type=int, default=1800,
                     help="tokens Telp may send the model per turn")
+    sp.add_argument("--timeout", type=float, default=600,
+                    help="seconds to wait without hearing from the server "
+                         "(default 600; 0 = as long as it stays alive)")
     if not full:
         return
+    sp.add_argument("--max-tokens", type=int, default=4096,
+                    help="most tokens the model may write per call, "
+                         "thinking included (default 4096; 0 = only the "
+                         "loaded context limits it)")
     sp.add_argument("--no-check", action="store_true",
                     help="don't check the answer against the sources")
     sp.add_argument("--stream", action="store_true",
