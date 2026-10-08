@@ -187,6 +187,14 @@ def test_forget_is_handled_by_telp_and_drops_the_conversation_about_it(telp):
         assert len(llm.requests) == 2
 
 
+def test_a_vague_forget_never_wipes_the_conversation(telp):
+    with FakeLLM(lambda req: "It is what it is.") as llm:
+        h = _harness(telp, llm)
+        h.ask("what is it like in Iceland?")
+        turn = h.ask("forget it")
+        assert turn.handled_by == "telp" and h.state.count() == 1
+
+
 def test_forget_this_conversation_clears_it(telp):
     with FakeLLM(lambda req: "Noted.") as llm:
         h = _harness(telp, llm)

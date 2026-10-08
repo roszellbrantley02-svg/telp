@@ -322,7 +322,11 @@ def cmd_llm(args) -> int:
     except ValueError as e:                   # e.g. a --budget too small
         print(f"[llm] {e}")
         return 2
-    _llm_turn(h, " ".join(args.question), args.stream)
+    try:
+        _llm_turn(h, " ".join(args.question), args.stream)
+    except KeyboardInterrupt:
+        print("\n[llm] stopped.")
+        return 130
     return 0
 
 
@@ -368,7 +372,10 @@ def cmd_llm_chat(args) -> int:
         elif cmd.startswith("/"):
             print("[llm-chat] commands: /sources /meter /new /quit")
         else:
-            _llm_turn(h, line, args.stream)
+            try:
+                _llm_turn(h, line, args.stream)
+            except KeyboardInterrupt:          # a slow answer, cut short
+                print("\n[llm-chat] stopped.")
         print()
     return 0
 

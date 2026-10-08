@@ -104,21 +104,25 @@ come comes came use used uses using find finds found show shows showed
 shown say says said according fact actually simply currently today recently
 time times year years day days various certain specific particular several
 many numerous multiple whole entire full real true remains remain remained
-anymore longer
+anymore longer old age aged
 """.split())
 
-# Words that talk about the answer itself rather than the world: a
-# sentence made only of these ("Here's what I found") claims nothing.
+# Words about the answer and where it came from rather than about the
+# world ("Here's what I found", "my sources disagree: you told me...").
+# They are not matched against sources - the citations carry provenance -
+# and a sentence made only of them claims nothing.
 _META = frozenset("""
-here there found find finding findings summary summarize summarized short
-overall answer answers answered question questions source sources memory
-memories note notes according following follows below above detail details
-information info fact facts key point points main quick brief briefly
-explain explanation look looked looking check checked search searched say
-says said tell told mention mentioned know knew known remember recall think
-believe guess sure certain hope help helps thing things way something
-anything everything result results based ask asked telp assistant word
-words provided provide given gave give clear clearly short long story
+here there found find finding findings summary summarize summarized overall
+answer answers answered question questions source sources memory memories
+note notes notebook according following follows below above detail details
+information info fact facts quick brief briefly explain explanation look
+looked looking check checked search searched say says said saying tell told
+telling mention mentions mentioned know knew known remember remembered recall
+think believe guess sure certain hope help helps something anything
+everything result results based ask asked telp assistant provided provide
+disagree disagrees disagreement agree agrees conflict conflicts conflicting
+differ differs list lists listed report reports reported state states stated
+wikipedia newest latest saved learned taught user
 """.split())
 
 _DISCOURSE = frozenset("""
@@ -206,6 +210,15 @@ class _Tok:
     neg: bool       # not / never / "wasn't"...
 
 
+def _lower(text: str) -> str:
+    """Lower case, same length: positions found in it index the original
+    (a few characters, like 'İ', grow when lower-cased)."""
+    low = text.lower()
+    if len(low) == len(text):
+        return low
+    return "".join(c.lower() if len(c.lower()) == 1 else c for c in text)
+
+
 def _base(raw: str) -> tuple[str, bool]:
     w = raw.lower()
     if w.endswith("n't"):
@@ -233,8 +246,11 @@ _SUFFIXES = ("ational", "ations", "ation", "ingly", "ically", "ness",
 _SUFFIXES = tuple(sorted(_SUFFIXES, key=len, reverse=True))
 _IRREGULAR = {"died": "die", "dies": "die", "dying": "die", "children": "child",
               "men": "man", "women": "woman", "people": "person",
-              "lives": "life", "wives": "wife", "mice": "mouse",
+              "lives": "live", "wives": "wife", "mice": "mouse",
               "geese": "goose", "teeth": "tooth", "big": "large",
+              "death": "die", "deaths": "die", "birth": "born",
+              "births": "born", "life": "live", "lifetime": "live",
+              "lived": "live",
               "bigger": "larger", "biggest": "largest"}
 
 
@@ -775,6 +791,19 @@ def _is_name(t: _Tok, i: int, text: str, vocab: set[str]) -> bool:
                 or b.endswith(("ed", "ing", "ly")))
 
 
+def _negates(toks: list[_Tok], i: int, text: str) -> bool:
+    """Is token i a real 'not'? 'No, he died in 1642', 'No. 5' and 'not
+    only... but also' deny nothing."""
+    t = toks[i]
+    if not t.neg:
+        return False
+    nxt = toks[i + 1].base if i + 1 < len(toks) else ""
+    if t.base == "no" and (nxt.isdigit() or (
+            i == 0 and re.match(r"\s*[,!.;:-]", text[t.end:]))):
+        return False
+    return not (t.base == "not" and nxt in ("only", "just", "merely"))
+
+
 def _following(toks: list[_Tok], i: int, limit: int = 3) -> list[str]:
     """Stems of the next few meaningful words after token i - what a
     'not' at i is about. Stops at 'but' ('not Akureyri but Reykjavik')."""
@@ -794,7 +823,7 @@ def _parse_claim(text: str, vocab: set[str]) -> _Claim:
     """Pull out what a source must contain for this sentence to stand:
     its numbers, dates and names (strict) and its other words (soft)."""
     toks = _tokens(text)
-    low = text.lower()
+    low = _lower(text)
     starts = [t.start for t in toks]
     used = [False] * len(toks)
     keys: list[_Key] = []
@@ -828,8 +857,7 @@ def _parse_claim(text: str, vocab: set[str]) -> _Claim:
     for i, t in enumerate(toks):
         if used[i]:
             continue
-        if t.neg and not (t.base == "no" and i + 1 < len(toks)
-                          and toks[i + 1].base.isdigit()):
+        if _negates(toks, i, text):
             neg_follow.extend(_following(toks, i))
             continue
         b = t.base
@@ -846,9 +874,11 @@ def _parse_claim(text: str, vocab: set[str]) -> _Claim:
             names.add(b)
             last_name = i
             continue
-        if b in _STOP or len(b) < 2:
+        if b in _STOP or len(b) < 2 or b in _META:
             continue
         st = _stem(b)
+        if st in _META_STEMS:
+            continue
         generic = b in _GENERIC or st in _GENERIC_STEMS
         words.append((st, GENERIC_WEIGHT if generic else 1.0, b, i))
     return _Claim(keys, words, {w[0] for w in words}, names, neg_follow)
@@ -856,8 +886,7 @@ def _parse_claim(text: str, vocab: set[str]) -> _Claim:
 
 def _checkable(claim: _Claim) -> bool:
     """Does the sentence say anything about the world at all?"""
-    return bool(claim.keys) or any(
-        w[2] not in _META and w[0] not in _META_STEMS for w in claim.words)
+    return bool(claim.keys or claim.words)
 
 
 # ─── the evidence, indexed once per answer ──────────────────────────
@@ -877,6 +906,13 @@ class _Item:
     md: set[tuple] = field(default_factory=set)
     neg_follow: set[str] = field(default_factory=set)
     lower: set[str] = field(default_factory=set)
+
+
+# "Galileo Galilei (15 February 1564 - 8 January 1642) was..." - how
+# encyclopedias say born / died / lived without the words
+_LIFESPAN = re.compile(r"\([^()]*?\d{3,4}\s*(?:bce?|ad|ce)?\s*(?:-|to|until)"
+                       r"\s*[^()]*?\d{3,4}[^()]*\)", re.I)
+_LIFE_STEMS = frozenset(_stem(w) for w in ("born", "die", "live"))
 
 
 def _add_date(it: _Item, y, m, d, as_numbers: bool = True) -> None:
@@ -902,7 +938,7 @@ def _index_item(ev: Evidence) -> _Item:
                                                or (ev.source or "").startswith("tool:")))
     toks = _tokens(full)
     used = [False] * len(toks)
-    low = full.lower()
+    low = _lower(full)
     chars = list(low)
     starts = [t.start for t in toks]
     for alts, s, e in _find_dates(low):
@@ -935,11 +971,13 @@ def _index_item(ev: Evidence) -> _Item:
         if len(st) >= 6:
             it.prefixes.add(st[:6])
         it.forms |= _name_forms(t.base)
+    if _LIFESPAN.search(body):
+        it.stems |= _LIFE_STEMS
     body_toks = [t for t in toks if t.end <= len(body)]
     for i, t in enumerate(body_toks):
         if t.raw.islower():
             it.lower.add(t.base)
-        if t.neg:
+        if _negates(body_toks, i, body):
             it.neg_follow.update(_following(body_toks, i))
     return it
 
@@ -1013,6 +1051,7 @@ class _Verdict:
     missing_keys: list[str]
     missing_words: list[str]
     problem: str = ""           # negation | mixed
+    anchors: int = 0            # keys found + informative words matched
 
 
 def _negation_clash(claim: _Claim, items: list[_Item]) -> bool:
@@ -1069,7 +1108,7 @@ def _judge(claim: _Claim, items: list[_Item], aligner: _Aligner,
     tool_only = all(it.tool for it in items)
     got = total = 0.0
     misses: list[str] = []
-    informative = 0
+    informative = matched = 0
     for stem, weight, word, _pos in claim.words:
         total += weight
         if weight >= 1:
@@ -1078,6 +1117,7 @@ def _judge(claim: _Claim, items: list[_Item], aligner: _Aligner,
             use_encoder and any(aligner.hit(word, it) for it in items))
         if hit:
             got += weight
+            matched += weight >= 1
         elif weight >= 1 and word not in misses:
             misses.append(word)
     overlap = got / total if total else 1.0
@@ -1093,7 +1133,8 @@ def _judge(claim: _Claim, items: list[_Item], aligner: _Aligner,
         ok, problem = False, "negation"
     elif ok and len(items) > 1 and not _bound(claim, items, aligner):
         ok, problem = False, "mixed"
-    return _Verdict(ok, score, missing_keys, misses, problem)
+    anchors = n_keys - len(missing_keys) + matched
+    return _Verdict(ok, score, missing_keys, misses, problem, anchors)
 
 
 def _best_single(claim: _Claim, items: list[_Item], aligner: _Aligner
@@ -1277,11 +1318,15 @@ def _check_sentence(sentence: str, kind: str, index: _Index,
             note = _why_not(verdict, [it.ev.n for it in valid], cited=True)
             others = [it for it in index.items if it not in valid]
             right, rv = _best_single(claim, others, _Aligner(None))
-            if right is not None and rv.ok:
+            if right is not None and rv.ok and rv.anchors >= 2:
                 note += f"; [{right.ev.n}] does say it"
     elif index.items:
         best, verdict = _best_single(claim, index.items, aligner)
-        if verdict.ok and not missing:
+        if verdict.ok and verdict.anchors < 2:
+            # "It is very big." shares one word with some source - too
+            # little to say WHICH source backs it, so nothing does
+            note = "too little in it to tie to a source"
+        elif verdict.ok and not missing:
             status, note = "supported", f"not cited; backed by [{best.ev.n}]"
         elif verdict.ok:
             note = f"[{best.ev.n}] says it"
