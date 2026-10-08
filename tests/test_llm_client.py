@@ -92,6 +92,46 @@ class _Scripted:
         self._server.server_close()
 
 
+class _RawServer:
+    """A bare TCP server for servers that don't speak HTTP properly: each
+    connection gets `greeting` (if any) and is then held open, never
+    answered. .connections counts how many were made."""
+
+    def __init__(self, greeting: bytes = b""):
+        self.greeting = greeting
+        self.connections = 0
+        self._held: list[socket.socket] = []
+        self._sock = socket.socket()
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(8)
+        self._sock.settimeout(0.05)
+        self.url = f"http://127.0.0.1:{self._sock.getsockname()[1]}/v1"
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._accept, daemon=True)
+
+    def _accept(self):
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                continue
+            self.connections += 1
+            self._held.append(conn)
+            if self.greeting:
+                conn.sendall(self.greeting)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join()
+        for conn in self._held:
+            conn.close()
+        self._sock.close()
+
+
 def _send_json(h, code: int, obj) -> None:
     data = json.dumps(obj).encode()
     h.send_response(code)
@@ -170,6 +210,113 @@ def test_model_detection_prefers_what_lm_studio_has_loaded():
         assert LLMClient(base_url=srv.url).model == "qwen3.8-27b"
 
 
+def test_an_auto_detected_model_follows_the_server(monkeypatch):
+    # regression: a picked model was kept for the whole session, and
+    # status() blamed the owner ("set TELP_LLM_MODEL") for the stale pick
+    with FakeLLM(lambda r: "hi", models=("qwen3-8b",)) as llm:
+        client = LLMClient(base_url=llm.url)
+        client.chat(USER)
+        assert llm.requests[-1]["model"] == "qwen3-8b"
+        llm.models[:] = ["qwen3.8-27b"]          # the owner loads another
+        info = client.status()
+        assert info["model"] == "qwen3.8-27b" and info["warnings"] == []
+        client.chat(USER)
+        assert llm.requests[-1]["model"] == "qwen3.8-27b"
+        # a pick is also checked again before a request once it is old
+        import mind.llm_client as llm_client
+        monkeypatch.setattr(llm_client, "_RECHECK_SECONDS", 0.0)
+        llm.models[:] = ["qwen3-14b"]
+        client.chat(USER)
+        assert llm.requests[-1]["model"] == "qwen3-14b"
+        # a model the owner named is never swapped
+        named = LLMClient(base_url=llm.url, model="qwen3-8b")
+        named.chat(USER)
+        assert llm.requests[-1]["model"] == "qwen3-8b"
+        assert any("'qwen3-8b' isn't in the server's list" in w
+                   for w in named.status()["warnings"])
+
+
+def test_a_missing_model_is_detected_again_and_asked_once_more():
+    models = ["old-model"]
+
+    def handle(h, method, body):
+        if method == "GET":
+            return _models(h, models)
+        if body["model"] in models:
+            return _send_json(h, 200, _body(f"from {body['model']}"))
+        _send_json(h, 404, {"error": {
+            "message": f"Model '{body['model']}' not found"}})
+    with _Scripted(handle) as srv:
+        client = LLMClient(base_url=srv.url)
+        assert client.chat(USER).text == "from old-model"
+        models[:] = ["new-model"]
+        assert client.chat(USER).text == "from new-model"
+        assert [r["model"] for r in srv.requests] == [
+            "old-model", "old-model", "new-model"]
+        # a model the owner named gets the error instead
+        with pytest.raises(LLMUnavailable, match="HTTP 404") as err:
+            LLMClient(base_url=srv.url, model="old-model").chat(USER)
+    assert err.value.status == 404
+
+
+def test_lm_studio_unloading_an_idle_model_keeps_the_choice(monkeypatch):
+    # with just-in-time loading LM Studio unloads an idle model; asking for
+    # the same one reloads it, where switching would load another download
+    states = {"zeta-chat": "loaded"}
+
+    def handle(h, method, body):
+        if h.path == "/api/v0/models":
+            return _send_json(h, 200, {"data": [
+                {"id": m, "type": "llm", "state": states.get(m, "not-loaded")}
+                for m in ("alpha-chat", "zeta-chat")]})
+        if method == "GET":
+            return _models(h, ("alpha-chat", "zeta-chat"))
+        _send_json(h, 200, _body("ok"))
+    import mind.llm_client as llm_client
+    monkeypatch.setattr(llm_client, "_RECHECK_SECONDS", 0.0)
+    with _Scripted(handle) as srv:
+        client = LLMClient(base_url=srv.url)
+        client.chat(USER)
+        states.clear()                           # unloaded after idling
+        client.chat(USER)
+        assert [r["model"] for r in srv.requests] == ["zeta-chat"] * 2
+
+
+def test_a_failed_recheck_keeps_the_old_choice(monkeypatch):
+    seen = {"gets": 0}
+
+    def handle(h, method, body):
+        if method == "GET":
+            seen["gets"] += 1
+            if seen["gets"] > 2:             # the model list stops answering
+                return _send_json(h, 500, {"error": "busy"})
+            return _models(h, ("qwen3.8-27b",))
+        _send_json(h, 200, _body("ok"))
+    import mind.llm_client as llm_client
+    monkeypatch.setattr(llm_client, "_RECHECK_SECONDS", 0.0)
+    with _Scripted(handle) as srv:
+        client = LLMClient(base_url=srv.url)
+        assert client.chat(USER).text == "ok"
+        assert client.chat(USER).text == "ok"   # the re-check failed
+        assert [r["model"] for r in srv.requests] == ["qwen3.8-27b"] * 2
+
+
+def test_an_embedding_model_is_never_picked():
+    # regression: with only LM Studio's embedding model loaded, the client
+    # picked it and status() said all was well
+    embed = "text-embedding-nomic-embed-text-v1.5"
+    with FakeLLM(lambda r: "hi", models=(embed,)) as llm:
+        client = LLMClient(base_url=llm.url)
+        with pytest.raises(LLMUnavailable, match="only has embedding models"):
+            client.model
+        with pytest.raises(LLMUnavailable, match="Load a chat model"):
+            client.chat(USER)
+        assert llm.requests == []
+        info = client.status()
+    assert info["reachable"] and info["model"] is None
+    assert any("only has embedding models" in w for w in info["warnings"])
+
+
 def test_no_model_loaded_is_explained():
     with FakeLLM(lambda r: "hi", models=()) as llm:
         client = LLMClient(base_url=llm.url)
@@ -217,7 +364,8 @@ def test_reasoning_content_is_kept_apart():
 
 
 def test_inline_think_is_split_off():
-    content = "<think>\nThe user wants the capital.\n</think>\n\nReykjavík [1]."
+    content = ("<think>\nThe user wants the capital.\n</think>\n\n"
+               "Reykjavík [1].")
     with FakeLLM(lambda r: content) as llm:
         reply = LLMClient(base_url=llm.url, model="m").chat(USER)
     assert reply.text == "Reykjavík [1]."
@@ -254,10 +402,10 @@ def test_split_thinking_shapes():
     # template opened <think> in the prompt: only the close shows
     assert split_thinking("weighing it</think>\n\nAnswer.") == \
         ("Answer.", "weighing it", False)
-    # several blocks, then an unclosed one
+    # several blocks (each starting a line), then an unclosed one
     text, thinking, cut = split_thinking(
-        "<think>a</think>One. <think>b</think>Two. <think>c")
-    assert text == "One. Two." and thinking == "a\n\nb\n\nc" and cut
+        "<think>a</think>One.\n<think>b</think>Two.\n<think>c")
+    assert text == "One.\nTwo." and thinking == "a\n\nb\n\nc" and cut
     assert split_thinking("") == ("", "", False)
 
 
@@ -266,6 +414,90 @@ def test_reasoning_field_and_inline_think_combine():
                             "reasoning_content": "separate"}) as llm:
         reply = LLMClient(base_url=llm.url, model="m").chat(USER)
     assert reply.text == "Done." and reply.thinking == "separate\n\ninline"
+
+
+def test_think_tags_mentioned_in_an_answer_stay_in_it():
+    # regression: a tag mentioned mid-sentence cut the answer short and
+    # the note invented a cause
+    answer = ("Qwen marks its reasoning with a <think> tag and then "
+              "answers [1].")
+    with FakeLLM(lambda r: {"content": answer,
+                            "reasoning_content": "User asks about tags."}) \
+            as llm:
+        reply = LLMClient(base_url=llm.url, model="m").chat(USER)
+    assert reply.text == answer and reply.notes == []
+    assert reply.thinking == "User asks about tags."
+    # without a reasoning field too, and for a stray closing tag
+    assert split_thinking(answer) == (answer, "", False)
+    closing = "The closing </think> tag ends reasoning; the answer follows."
+    assert split_thinking(closing) == (closing, "", False)
+    # the same while streaming, 8 characters at a time
+    tokens = []
+    with FakeLLM(lambda r: answer) as llm:
+        reply = LLMClient(base_url=llm.url, model="m").chat(
+            USER, stream=True, on_token=tokens.append)
+    assert "".join(tokens) == answer and reply.text == answer
+
+
+def test_a_template_that_opens_think_is_remembered():
+    # regression: with a chat template that writes <think> into the prompt
+    # (and LM Studio not splitting reasoning out), a reply cut off before
+    # its </think> came back as the answer, and streaming sent the
+    # reasoning to on_token
+    replies = iter([
+        # 1: starts mid-thought - the client learns the template's habit
+        _body("The user asks about Iceland.\n</think>\n\nReykjavík [1]."),
+        # 2: cut off while still thinking
+        _body("Okay, the user asks about Iceland. Source [1] says "
+              "Reykjavík, but maybe I should", finish="length"),
+        # 3: streamed, thinking then answer
+        _body("Weighing source [1].\n</think>\n\nReykjavík [1]."),
+        # 4: streamed, cut off while thinking
+        _body("Still weighing source [1] and", finish="length"),
+        # 5: no tags and finished: the template didn't open one this time
+        _body("Reykjavík [1]."),
+        # 6: the reply opens its own <think>: the habit is forgotten
+        _body("<think>own tag</think>\n\nReykjavík [1]."),
+    ])
+    with FakeLLM(lambda r: next(replies)) as llm:
+        client = LLMClient(base_url=llm.url, model="m")
+        first = client.chat(USER)
+        assert first.text == "Reykjavík [1]."
+        assert first.thinking == "The user asks about Iceland."
+        assert client.template_opens_think
+
+        cut = client.chat(USER)
+        assert cut.text == "" and cut.truncated
+        assert cut.thinking.startswith("Okay, the user asks")
+        assert any("ran out of room while still thinking" in n
+                   for n in cut.notes)
+
+        tokens, thoughts = [], []
+        streamed = client.chat(USER, stream=True, on_token=tokens.append,
+                               on_thinking=thoughts.append)
+        assert "".join(tokens) == "Reykjavík [1]."
+        assert "Weighing source [1]." in "".join(thoughts)
+        assert streamed.text == "Reykjavík [1]."
+        assert streamed.thinking == "Weighing source [1]."
+
+        tokens = []
+        cut = client.chat(USER, stream=True, on_token=tokens.append)
+        assert tokens == [] and cut.text == "" and cut.truncated
+        assert any("still thinking" in n for n in cut.notes)
+
+        tokens = []
+        plain = client.chat(USER, stream=True, on_token=tokens.append)
+        assert "".join(tokens) == "Reykjavík [1]."
+        assert plain.text == "Reykjavík [1]." and plain.thinking == ""
+
+        own = client.chat(USER)
+        assert own.text == "Reykjavík [1]." and own.thinking == "own tag"
+        assert not client.template_opens_think
+    # the same rules for a whole text
+    assert split_thinking("half a thought", opens_think=True, cut=True) == \
+        ("", "half a thought", True)
+    assert split_thinking("An answer.", opens_think=True) == \
+        ("An answer.", "", False)
 
 
 # ─── tool calls ─────────────────────────────────────────────────────
@@ -310,6 +542,37 @@ def test_bad_tool_arguments_become_empty_with_a_note():
     assert "search_memory" in reply.notes[0]
     assert "valid JSON" in reply.notes[0]
     assert "calculate" in reply.notes[1]
+
+
+def test_null_arguments_and_notes_in_plain_words():
+    # regression: "null" (no arguments) gave a note naming NoneType, and a
+    # list's note named a Python type too
+    calls = [{"id": "a", "type": "function", "function": {
+                 "name": "today", "arguments": "null"}},
+             {"id": "b", "type": "function", "function": {
+                 "name": "calculate", "arguments": "[1, 2]"}},
+             {"id": "c", "type": "function", "function": {
+                 "name": "calculate", "arguments": '"two plus two"'}}]
+    with FakeLLM(lambda r: _body(None, "tool_calls",
+                                 tool_calls=calls)) as llm:
+        reply = LLMClient(base_url=llm.url, model="m").chat(USER, tools=TOOLS)
+    assert [c.arguments for c in reply.tool_calls] == [{}, {}, {}]
+    assert len(reply.notes) == 2                 # nothing about "today"
+    assert "sent a list instead of named arguments" in reply.notes[0]
+    assert "sent a piece of text instead" in reply.notes[1]
+    assert not any(word in " ".join(reply.notes)
+                   for word in ("NoneType", "list arguments", "str"))
+
+
+def test_tool_call_text_with_parameters_is_read():
+    # regression: Qwen's "parameters" spelling silently lost the query
+    content = ('<tool_call>{"name": "search_memory", "parameters": '
+               '{"query": "Iceland"}}</tool_call>')
+    with FakeLLM(lambda r: content) as llm:
+        reply = LLMClient(base_url=llm.url, model="m").chat(USER, tools=TOOLS)
+    assert reply.tool_calls == [ToolCall("call_text_0", "search_memory",
+                                         {"query": "Iceland"})]
+    assert reply.notes == []
 
 
 def test_tool_call_written_as_text_is_read_back():
@@ -493,6 +756,45 @@ def test_streaming_tool_call_deltas_and_reasoning_field():
     assert reply.notes == []
 
 
+def _stream_calls(deltas) -> ChatReply:
+    chunks = [_delta(tool_calls=[d]) for d in deltas] + [
+        {"choices": [{"index": 0, "delta": {},
+                      "finish_reason": "tool_calls"}]}]
+
+    def handle(h, method, body):
+        _send_sse(h, chunks)
+    with _Scripted(handle) as srv:
+        return LLMClient(base_url=srv.url, model="m").chat(
+            USER, tools=TOOLS, stream=True)
+
+
+def test_streamed_parallel_calls_that_reuse_an_index():
+    # regression: a second call on index 0 with a new id was glued onto
+    # the first ("search_memorycalculate", arguments lost)
+    search = {"name": "search_memory", "arguments": '{"query":"Iceland"}'}
+    calc = {"name": "calculate", "arguments": '{"expr":"2+2"}'}
+    reply = _stream_calls([
+        {"index": 0, "id": "a", "type": "function", "function": search},
+        {"index": 0, "id": "b", "type": "function", "function": calc}])
+    assert reply.tool_calls == [
+        ToolCall("a", "search_memory", {"query": "Iceland"}),
+        ToolCall("b", "calculate", {"expr": "2+2"})]
+    assert reply.notes == []
+    # no index and no id at all: a new name after whole arguments
+    reply = _stream_calls([{"function": search}, {"function": calc}])
+    assert [(c.name, c.arguments) for c in reply.tool_calls] == [
+        ("search_memory", {"query": "Iceland"}),
+        ("calculate", {"expr": "2+2"})]
+    # but a name repeated with every piece still belongs to one call
+    reply = _stream_calls([
+        {"index": 0, "id": "a", "function": {"name": "search_memory",
+                                             "arguments": '{"query": '}},
+        {"index": 0, "function": {"name": "search_memory",
+                                  "arguments": '"Iceland"}'}}])
+    assert reply.tool_calls == [ToolCall("a", "search_memory",
+                                         {"query": "Iceland"})]
+
+
 def test_streaming_bad_tool_arguments_note():
     chunks = [_delta(tool_calls=[{"index": 0, "id": "x", "function": {
                   "name": "search_memory", "arguments": '{"query": '}}]),
@@ -550,6 +852,82 @@ def test_stream_error_about_context_gets_the_hint():
     assert "9000 > 8192" in str(err.value)
     assert "raise Context Length" in str(err.value)
     assert err.value.partial is None
+
+
+def test_llama_cpp_error_field_mid_stream_is_reported():
+    # regression: llama-server sends "error: {...}" (not a data field) and
+    # then still sends [DONE]; the cut answer came back as a complete one
+    def handle(h, method, body):
+        _send_sse(h, [_delta(content="Reykjavik is"),
+                      'error: {"code":500,"message":"Context size has been '
+                      'exceeded."}\n\n'])
+    with _Scripted(handle) as srv:
+        with pytest.raises(LLMUnavailable) as err:
+            LLMClient(base_url=srv.url, model="m").chat(USER, stream=True)
+        assert len(srv.requests) == 1           # never retried
+    msg = str(err.value)
+    assert "Context size has been exceeded." in msg
+    assert "raise Context Length" in msg
+    assert err.value.partial.text == "Reykjavik is"
+
+
+def test_llama_cpp_error_before_any_token_is_reported():
+    def handle(h, method, body):
+        _send_sse(h, ['error: {"code":500,"message":"Context size has been '
+                      'exceeded."}\n\n'])
+    with _Scripted(handle) as srv:
+        with pytest.raises(LLMUnavailable, match="Context size") as err:
+            LLMClient(base_url=srv.url, model="m").chat(USER, stream=True)
+    assert err.value.partial is None
+
+
+def test_error_event_without_done_is_reported_not_retried():
+    # regression: "event: error" with plain-text data and no [DONE] was
+    # taken for a dropped connection, retried, and its text lost
+    def handle(h, method, body):
+        _send_sse(h, ["event: error\ndata: Model crashed while loading\n\n"],
+                  done=False)
+    with _Scripted(handle) as srv:
+        with pytest.raises(LLMUnavailable,
+                           match="stopped with an error: Model crashed"):
+            LLMClient(base_url=srv.url, model="m").chat(USER, stream=True)
+        assert len(srv.requests) == 1
+
+
+def test_done_without_finish_reason_is_noted():
+    def handle(h, method, body):
+        _send_sse(h, [_delta(content="Reykjavik is")])     # then [DONE]
+    with _Scripted(handle) as srv:
+        reply = LLMClient(base_url=srv.url, model="m").chat(USER, stream=True)
+    assert reply.text == "Reykjavik is" and reply.finish_reason == ""
+    assert any("may be incomplete" in n for n in reply.notes)
+
+
+def test_a_finished_stream_that_never_says_done_still_ends(monkeypatch):
+    # regression: a server that sends the finish and usage but no [DONE]
+    # and keeps the line open turned a complete answer into a timeout
+    import mind.llm_client as llm_client
+    monkeypatch.setattr(llm_client, "_TAIL_TIMEOUT", 0.2)
+    release = threading.Event()
+
+    def handle(h, method, body):
+        _send_sse(h, [_delta(content="Reykjavík [1]."),
+                      {"choices": [{"index": 0, "delta": {},
+                                    "finish_reason": "stop"}]},
+                      {"choices": [], "usage": {"prompt_tokens": 9,
+                                                "completion_tokens": 4,
+                                                "total_tokens": 13}}],
+                  done=False)
+        release.wait(5)                          # ...and the line stays open
+    with _Scripted(handle) as srv:
+        started = time.monotonic()
+        reply = LLMClient(base_url=srv.url, model="m", timeout=30).chat(
+            USER, stream=True)
+        took = time.monotonic() - started
+        release.set()
+    assert took < 2.0
+    assert reply.text == "Reykjavík [1]." and reply.finish_reason == "stop"
+    assert reply.usage["total_tokens"] == 13 and reply.notes == []
 
 
 def test_a_failing_on_token_is_not_blamed_on_the_server():
@@ -681,17 +1059,125 @@ def test_stream_drop_mid_answer_keeps_what_arrived():
     assert err.value.partial.text == "Reykjavík is the cap"
 
 
-def test_timeout_is_honoured_and_not_retried():
+def test_a_slow_answer_without_streaming_is_waited_for():
+    # regression: stream=False gave up after `timeout` seconds although the
+    # server was busy writing (a 27B thinking on a small GPU stays silent
+    # for many minutes); silence is now checked against a quick GET /models
     def slow(req):
-        time.sleep(1.0)
-        return "too late"
+        time.sleep(1.2)                  # a model writing steadily, slowly
+        return "Reykjavík [1]."
     with FakeLLM(slow) as llm:
-        client = LLMClient(base_url=llm.url, model="m", timeout=0.3)
+        client = LLMClient(base_url=llm.url, model="m", timeout=0.4)
         started = time.monotonic()
-        with pytest.raises(LLMUnavailable, match="within 0.3 seconds"):
+        reply = client.chat(USER)
+        assert time.monotonic() - started >= 1.2
+        assert len(llm.requests) == 1    # waited, never asked twice
+    assert reply.text == "Reykjavík [1]."
+
+
+def test_a_server_that_goes_silent_is_given_up_on_and_not_retried():
+    # accepts connections, never answers - not even the quick check
+    with _RawServer() as srv:
+        client = LLMClient(base_url=srv.url, model="m", timeout=0.3)
+        started = time.monotonic()
+        with pytest.raises(LLMUnavailable) as err:
             client.chat(USER)
-        assert time.monotonic() - started < 0.9
-        assert len(llm.requests) == 1
+        took = time.monotonic() - started
+        assert srv.connections == 2      # the request and one check
+    msg = str(err.value)
+    assert "nothing for 0.3 seconds" in msg and "stuck or gone" in msg
+    assert "reads long prompts" not in msg      # not blamed on the prompt
+    assert took < 2.0
+
+
+def test_a_stream_that_stalls_says_where():
+    release = threading.Event()
+
+    def handle(h, method, body):
+        _send_sse(h, [_delta(content="Reykjavík is")], done=False)
+        release.wait(5)
+    with _Scripted(handle) as srv:
+        with pytest.raises(LLMUnavailable, match="went quiet for 0.3 "
+                           "seconds part-way") as err:
+            LLMClient(base_url=srv.url, model="m", timeout=0.3).chat(
+                USER, stream=True)
+        release.set()
+        assert len(srv.requests) == 1
+    assert err.value.partial.text == "Reykjavík is"
+
+
+def test_an_unreachable_machine_fails_fast_with_its_own_message():
+    # regression: connecting used the whole answer timeout (600 s), and
+    # the message blamed a long prompt. A full listen queue drops SYNs,
+    # so connecting hangs like a PC that is asleep.
+    with socket.socket() as full:
+        full.bind(("127.0.0.1", 0))
+        full.listen(0)
+        port = full.getsockname()[1]
+        filler = socket.create_connection(("127.0.0.1", port), timeout=1)
+        try:
+            try:
+                socket.create_connection(("127.0.0.1", port),
+                                         timeout=0.2).close()
+                pytest.skip("this system doesn't drop SYNs on a full queue")
+            except TimeoutError:
+                pass
+            client = LLMClient(base_url=f"http://127.0.0.1:{port}/v1",
+                               model="m")
+            assert client.timeout == 600 and client.connect_timeout == 5.0
+            client.connect_timeout = 0.3
+            started = time.monotonic()
+            with pytest.raises(LLMUnavailable) as err:
+                client.chat(USER)
+            assert time.monotonic() - started < 2.0
+            info = client.status()
+        finally:
+            filler.close()
+    msg = str(err.value)
+    assert "Couldn't connect" in msg and "within 0.3 seconds" in msg
+    assert "is that PC on" in msg and "TELP_LLM_URL" in msg
+    assert info["reachable"] is False and "Couldn't connect" in info["error"]
+
+
+def test_typo_d_addresses_are_explained_not_crashed_on():
+    # regression: an out-of-range port raised ValueError from the
+    # constructor; a non-numeric one was "dropped (and again on a retry)"
+    for url in ("http://localhost:123456/v1", "http://127.0.0.1:12a4/v1",
+                "ftp://localhost:1234/v1"):
+        client = LLMClient(base_url=url, model="m")      # no crash here
+        with pytest.raises(LLMUnavailable, match="isn't valid") as err:
+            client.chat(USER)
+        assert "Check TELP_LLM_URL" in str(err.value)
+        info = client.status()
+        assert info["reachable"] is False
+        assert "Check TELP_LLM_URL" in info["error"]
+        with pytest.raises(LLMUnavailable, match="isn't valid"):
+            LLMClient(base_url=url).model
+
+
+def test_a_port_that_doesnt_speak_http():
+    # regression: retried as a "dropped" connection, with raw control
+    # bytes in the message
+    with _RawServer(greeting=b"\x15\x03\x01\x00\x02\x02\n") as srv:
+        with pytest.raises(LLMUnavailable) as err:
+            LLMClient(base_url=srv.url, model="m").chat(USER)
+        assert srv.connections == 1                    # not retried
+    msg = str(err.value)
+    assert "not in HTTP" in msg and "right port" in msg
+    assert "TELP_LLM_URL" in msg and msg.isprintable()
+
+
+def test_timeout_none_means_no_limit_and_junk_is_refused():
+    # regression: timeout=None raised TypeError
+    with FakeLLM(lambda r: "ok") as llm:
+        client = LLMClient(base_url=llm.url, model="m", timeout=None)
+        assert client.timeout is None
+        assert client.chat(USER).text == "ok"
+        assert client.chat(USER, stream=True).text == "ok"
+        assert client.status()["reachable"]
+    for bad in ("soon", 0, -5):
+        with pytest.raises(ValueError, match="timeout must be"):
+            LLMClient(model="m", timeout=bad)
 
 
 def test_non_json_reply_is_explained():
@@ -791,6 +1277,31 @@ def test_status_warns_about_unloaded_and_unknown_models():
         info = LLMClient(base_url=srv.url, model="mistral").status()
         assert any("'mistral' isn't in the server's list" in w
                    for w in info["warnings"])
+
+
+def test_status_when_the_server_answers_with_an_error():
+    # regression: a server that answered 401 (or 404, for a wrong path)
+    # was reported as down
+    def handle(h, method, body):
+        code = 401 if "/locked/" in h.path else 404
+        _send_json(h, code, {"error": "Invalid API key" if code == 401
+                             else "Unexpected endpoint"})
+    with _Scripted(handle) as srv:
+        root = srv.url[:-len("/v1")]
+        info = LLMClient(base_url=root + "/locked/v1").status()
+        assert info["reachable"] is True
+        assert any("API key" in w for w in info["warnings"])
+        info = LLMClient(base_url=root + "/wrong/v1").status()
+        assert info["reachable"] is True and "HTTP 404" in info["error"]
+        assert any("Check TELP_LLM_URL" in w for w in info["warnings"])
+
+
+def test_a_pasted_endpoint_becomes_the_base_address():
+    for pasted in ("http://localhost:1234/v1/chat/completions",
+                   "http://localhost:1234/v1/models/",
+                   "localhost:1234/v1/completions"):
+        assert LLMClient(base_url=pasted, model="m").base_url == \
+            "http://localhost:1234/v1"
 
 
 def test_status_on_a_plain_openai_server_without_context_info():

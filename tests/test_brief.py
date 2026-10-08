@@ -7,7 +7,8 @@ from datetime import date
 
 import pytest
 
-from mind.brief import SYSTEM_PROMPT, BriefBuilder, ConversationState
+from mind.brief import (SYSTEM_PROMPT, BriefBuilder, ConversationState,
+                        _dedup, _entities, _sentences)
 from mind.harness_types import Evidence, estimate_tokens
 
 TODAY = date(2026, 10, 8)
@@ -43,6 +44,19 @@ def _builder(telp, **kw) -> BriefBuilder:
 def _state(telp, session: str = "default") -> ConversationState:
     return ConversationState(telp.agent.lattice._con, session=session,
                              encoder=telp.agent.encoder)
+
+
+def _whole_sentences_of(shown: str, stored: list[str]) -> bool:
+    """Is every '…'-separated part of `shown` a run of whole sentences of
+    one stored text (never a sentence cut short)?"""
+    parts = [p.strip() for p in shown.split("…") if p.strip()]
+    for text in stored:
+        text = " ".join(text.split())
+        whole = set(_sentences(text))
+        if parts and all(p in text and set(_sentences(p)) <= whole
+                         for p in parts):
+            return True
+    return False
 
 
 # ─── evidence from memory ───────────────────────────────────────────
@@ -185,11 +199,15 @@ def test_budget_holds_for_huge_inputs_and_never_cuts_mid_sentence(telp):
                                   today=TODAY)
             assert brief.token_estimate() <= budget, (budget, q[:30])
             assert brief.evidence, budget
+            assert builder.dropped == []
             for e in brief.evidence:
-                # whole sentences only: a leading run of the stored text
-                assert e.text.endswith((".", "!", "?"))
-                if e.kind == "memory":
-                    assert any(s.startswith(e.text) for s in stored)
+                if e.kind == "tool":
+                    # the caller's result is always shown; a cut is marked
+                    assert e.text == " ".join(long_text.split()) or \
+                        e.text.endswith("… (shortened)")
+                    continue
+                # whole sentences only, every gap marked with '…'
+                assert _whole_sentences_of(e.text, stored), e.text
             if q is huge_question:
                 assert len(brief.question) < len(q)
                 assert brief.question.endswith("So when did Hekla erupt?")
@@ -223,8 +241,8 @@ def test_system_and_standing_are_byte_identical_across_turns(telp):
     assert all(p == prefixes[0] for p in prefixes)
     system, standing, _ = prefixes[0]
     assert system == SYSTEM_PROMPT
-    # who the user is comes first, whatever order it was learned in
-    assert standing == "- User's name is Eric.\n- User likes astronomy."
+    # in the order learned: a new fact can only ever extend the block
+    assert standing == "- User likes astronomy.\n- User's name is Eric."
 
     # the date changes daily, so it lives after the cached prefix
     later = builder.build("who was Galileo?", state=state,
@@ -238,6 +256,10 @@ def test_system_and_standing_are_byte_identical_across_turns(telp):
     grown = builder.build("who was Galileo?", state=state, today=TODAY)
     assert grown.standing.startswith(standing)
     assert grown.standing.endswith("- User has two cats.")
+    # ... even a fact about who the user is, learned late
+    telp.user_facts.add("User lives in Oslo.")
+    again = builder.build("who was Galileo?", state=state, today=TODAY)
+    assert again.standing == grown.standing + "\n- User lives in Oslo."
 
 
 def test_standing_is_capped_and_overflow_facts_come_when_relevant(telp):
@@ -471,3 +493,340 @@ def test_fact_lines_are_optional_and_a_broken_fact_layer_is_ignored(telp):
     assert [e.n for e in rich.evidence] == \
         list(range(1, len(rich.evidence) + 1))
     assert rich.evidence[-1].kind == "fact"     # after the memory sentences
+
+
+# ─── regressions found in review ────────────────────────────────────
+
+PEOPLE = [
+    ("Galileo Galilei was an Italian astronomer and physicist.",
+     "wikipedia:Galileo Galilei"),
+    ("Galileo Galilei was born in Pisa in 1564.",
+     "wikipedia:Galileo Galilei"),
+    ("Galileo Galilei died in Arcetri in 1642.",
+     "wikipedia:Galileo Galilei"),
+    ("Marie Curie was born in Warsaw in 1867.", "wikipedia:Marie Curie"),
+    ("Marie Curie died in Passy in 1934.", "wikipedia:Marie Curie"),
+    ("Isaac Newton was born in Woolsthorpe in 1643.",
+     "wikipedia:Isaac Newton"),
+    ("Isaac Newton died in London in 1727.", "wikipedia:Isaac Newton"),
+]
+
+
+def _teach_people(telp) -> None:
+    for text, src in PEOPLE:
+        telp.agent.lattice.add(text, source=src)
+
+
+def test_a_models_opening_words_are_not_the_person_discussed(telp):
+    _teach_people(telp)
+    builder = _builder(telp)
+    for i, opener in enumerate(("Based on the sources, ",
+                                "According to my notes, ", "Certainly! ",
+                                "Great question. ")):
+        state = _state(telp, session=f"opener-{i}")
+        state.add_turn("who was galileo galilei?",
+                       opener + "Galileo Galilei was an Italian astronomer "
+                       "and physicist [1]. He is famous for his telescope [1].")
+        assert state.focus_entities(kind="person") == ["Galileo Galilei"]
+        born = builder.build("when was he born?", state=state, today=TODAY)
+        assert born.evidence[0].text == \
+            "Galileo Galilei was born in Pisa in 1564.", opener
+        assert "Recently discussed: Galileo Galilei" in born.state
+        died = builder.build("when did he die?", state=state, today=TODAY)
+        assert died.evidence and died.evidence[0].text == \
+            "Galileo Galilei died in Arcetri in 1642.", opener
+    # real names at the start of a sentence still count
+    assert _entities("Galileo discovered moons.") == ["Galileo"]
+    assert _entities("Emily wrote a book.") == ["Emily"]
+    assert _entities("Nice is a city in France.") == ["Nice", "France"]
+    assert _entities("Kepler?") == ["Kepler"]
+    assert _entities("Describe Galileo Galilei.") == ["Galileo Galilei"]
+
+
+def test_follow_ups_opening_with_an_interjection_still_mean_him(telp):
+    _teach_people(telp)
+    builder = _builder(telp)
+    state = _state(telp)
+    state.add_turn("who was Galileo Galilei?",
+                   "Galileo Galilei was an Italian astronomer and "
+                   "physicist [1].")
+    for q in ("Wow, where was he born?", "Interesting. Where was he born?",
+              "Hmm, where was he born?", "Really? Where was he born?",
+              "Cool, and where was he born?", "Describe where he was born."):
+        assert _entities(q) == [], q
+        brief = builder.build(q, state=state, today=TODAY)
+        assert brief.evidence[0].text == \
+            "Galileo Galilei was born in Pisa in 1564.", q
+        # the subject's own sentence is there: other people's births aren't
+        assert not any("Curie" in e.text or "Newton" in e.text
+                       for e in brief.evidence), q
+    # a follow-up that names its own subject is not rewritten
+    named = builder.build("Marie Curie, where was she born?", state=state,
+                          today=TODAY)
+    assert named.evidence[0].text == "Marie Curie was born in Warsaw in 1867."
+
+
+def test_disagreeing_and_richer_sentences_are_not_duplicates(telp):
+    def texts(*sentences):
+        items = [Evidence(n=0, text=t, memory_id=i)
+                 for i, t in enumerate(sentences)]
+        return [e.text for e in _dedup(items)]
+
+    pluto = ("Pluto is a planet in the outer solar system.",
+             "Pluto is not a planet in the outer solar system.")
+    assert texts(*pluto) == list(pluto)
+    assert texts(*reversed(pluto)) == list(reversed(pluto))
+    assert len(texts("Pluto isn't a planet.", "Pluto is a planet.")) == 2
+    everest = ("Mount Everest is the highest mountain on Earth at 8848 "
+               "metres above sea level.",
+               "Mount Everest is the highest mountain on Earth at 8849 "
+               "metres above sea level.")
+    assert texts(*everest) == list(everest)
+    richer = ("Galileo Galilei was born in Pisa in 1564.",
+              "Galileo Galilei was born in Pisa in 1564 and died in "
+              "Arcetri in 1642.")
+    assert texts(*richer) == list(richer)
+    assert len(texts("The meeting is on Tuesday at the clinic downtown.",
+                     "The meeting is on Thursday at the clinic downtown.")) \
+        == 2
+    # ...while a sentence that adds nothing still goes, whichever comes first
+    assert texts(richer[1], richer[0]) == [richer[1]]
+    assert len(texts("Reykjavik is the capital and largest city of Iceland.",
+                     "Reykjavík is the capital and the largest city of "
+                     "Iceland!")) == 1
+
+    lat = telp.agent.lattice
+    lat.add(pluto[0], source="old_textbook")
+    lat.add(pluto[1], source="user_taught")
+    for text in everest:
+        lat.add(text, source="wikipedia:Mount Everest")
+    builder = _builder(telp)
+    shown = [e.text for e in builder.build(
+        "is Pluto a planet in the solar system?", today=TODAY).evidence]
+    assert set(pluto) <= set(shown)
+    shown = [e.text for e in builder.build(
+        "how high is Mount Everest?", today=TODAY).evidence]
+    assert set(everest) <= set(shown)
+
+
+def test_a_long_row_shows_the_sentence_that_answers_and_search_finds_the_rest(
+        telp):
+    lat = telp.agent.lattice
+    filler = [f"Galileo Galilei made observation number {i} about the sky "
+              f"and wrote about it at length." for i in range(30)]
+    answer = "Galileo Galilei was born in the city of Pisa in 1564."
+    row_id = lat.add(" ".join(filler + [answer]),
+                     source="wikipedia:Galileo Galilei")
+    lat.add("Marie Curie was born in Warsaw in 1867.",
+            source="wikipedia:Marie Curie")
+    builder = _builder(telp)
+    brief = builder.build("where was Galileo Galilei born?", today=TODAY)
+    row = next(e for e in brief.evidence if e.memory_id == row_id)
+    assert row.text.endswith("… " + answer)          # the gap is marked
+    assert _whole_sentences_of(row.text, [" ".join(filler + [answer])])
+    # digging deeper brings the sentences not shown yet, never repeats
+    more = builder.search("Galileo Galilei observation", limit=5,
+                          exclude=brief.evidence)
+    rest = next(e for e in more if e.memory_id == row_id)
+    shown = set(_sentences(row.text.replace("…", " ")))
+    assert set(_sentences(rest.text.replace("…", " "))).isdisjoint(shown)
+    assert len(rest.text) <= 300
+    # a row shown whole, or excluded by id, stays out
+    assert not any(e.memory_id == row_id for e in
+                   builder.search("Galileo Galilei", exclude=[row_id]))
+
+
+def test_questions_about_the_user_get_their_facts_as_numbered_sources(telp):
+    _teach_world(telp)
+    telp.user_facts.add("User's name is Eric.")
+    telp.user_facts.add("User lives in Oslo.")
+    telp.user_facts.add("User has two cats.")
+    builder = _builder(telp)
+    name = builder.build("what is my name?", today=TODAY)
+    assert "none found" not in name.messages()[1]["content"]
+    first = name.evidence[0]
+    assert (first.n, first.text, first.source, first.kind) == \
+        (1, "User's name is Eric.", "user_facts", "fact")
+    assert first.created_at and first.created_at[:4].isdigit()
+    assert [e.text for e in builder.build("where do I live?",
+                                          today=TODAY).evidence] == \
+        ["User lives in Oslo."]
+    me = [e.text for e in builder.build("who am I?", today=TODAY).evidence]
+    assert me[:2] == ["User's name is Eric.", "User lives in Oslo."]
+    # a question about something else doesn't drag the user's facts in
+    other = builder.build("what is the name of the capital of Iceland?",
+                          today=TODAY)
+    assert not any(e.source == "user_facts" for e in other.evidence)
+    assert other.standing == name.standing      # the prefix is untouched
+
+
+def test_non_latin_sentences_are_kept_apart_and_matched(telp):
+    rows = ["Москва — столица России.", "Москва основана Юрием Долгоруким.",
+            "Население Москвы составляет около тринадцати миллионов человек.",
+            "東京は日本の首都です。", "東京の人口は約1400万人です。"]
+    kept = _dedup([Evidence(n=0, text=t, memory_id=i)
+                   for i, t in enumerate(rows)])
+    assert [e.text for e in kept] == rows
+    for text in rows:
+        telp.agent.lattice.add(text, source="wikipedia:ru")
+    builder = _builder(telp)
+    q = "Москва столица России население"
+    plain = [e.text for e in builder.build(q, today=TODAY).evidence]
+    assert rows[0] in plain and rows[2] in plain
+    tool = Evidence(n=0, text="Сегодня четверг.", source="tool:today",
+                    kind="tool")
+    with_tool = builder.build(q, extra_evidence=[tool], today=TODAY)
+    assert with_tool.evidence[0].text == "Сегодня четверг."
+    assert [e.text for e in with_tool.evidence[1:]] == plain
+
+
+def test_abbreviations_never_end_a_shown_sentence(telp):
+    assert _sentences("John Smith served in the U.S. Navy for twenty years. "
+                      "He retired.") == [
+        "John Smith served in the U.S. Navy for twenty years.", "He retired."]
+    assert _sentences("Ada Lovelace was born on Dec. 10, 1815 in London.") \
+        == ["Ada Lovelace was born on Dec. 10, 1815 in London."]
+    assert _sentences("It was signed in Washington, D.C. In 1871 it was "
+                      "ratified.") == ["It was signed in Washington, D.C.",
+                                       "In 1871 it was ratified."]
+    assert _sentences("J. R. R. Tolkien wrote books. See Fig. 3 now.") == [
+        "J. R. R. Tolkien wrote books.", "See Fig. 3 now."]
+    row = ("John Smith served in the U.S. Navy for twenty years before he "
+           "retired to Florida and opened a bait shop. " + "He later wrote "
+           "several books about fishing in the Gulf of Mexico. " * 3)
+    telp.agent.lattice.add(row, source="wikipedia:John Smith")
+    builder = BriefBuilder(telp.agent, budget_tokens=500)
+    for n in range(1, 6):
+        for pad in range(0, 100, 20):
+            tools = [Evidence(n=0, text=f"Tool line {i}: the sea is calm "
+                              f"today. " + "x" * pad + ".", kind="tool",
+                              source="tool:x") for i in range(n)]
+            brief = builder.build("where did John Smith serve?",
+                                  extra_evidence=tools, today=TODAY)
+            for e in brief.evidence:
+                if e.kind == "memory":
+                    assert not e.text.endswith("U.S."), e.text
+                    assert _whole_sentences_of(e.text, [row]), e.text
+
+
+def test_an_it_that_points_at_nothing_does_not_bring_back_the_last_topic(
+        telp):
+    lat = telp.agent.lattice
+    for text in ("Reykjavik is the capital and largest city of Iceland.",
+                 "Iceland is an island country in the North Atlantic Ocean.",
+                 "Iceland has a population of about 390,000 people."):
+        lat.add(text, source="wikipedia:Iceland")
+    builder = _builder(telp)
+    state = _state(telp)
+    state.add_turn("what is the capital of Iceland?",
+                   "Reykjavik is the capital and largest city of Iceland [1].")
+    for q in ("what time is it?", "is it going to rain tomorrow?",
+              "can you explain how it works, the stock market I mean?"):
+        assert builder.build(q, state=state, today=TODAY).evidence == [], q
+    # a real 'it' still means Iceland
+    pop = builder.build("what is its population?", state=state, today=TODAY)
+    assert pop.evidence[0].text == \
+        "Iceland has a population of about 390,000 people."
+    more = builder.build("tell me more about it", state=state, today=TODAY)
+    assert {e.text for e in more.evidence} >= {
+        "Iceland is an island country in the North Atlantic Ocean."}
+
+
+def test_tool_results_always_appear_shortened_with_a_mark_if_need_be(telp):
+    _teach_world(telp)
+    big = "2**3000 = " + "1230231922" * 90
+    calc = Evidence(n=0, text=big, source="tool:calculate", kind="tool")
+    whole = BriefBuilder(telp.agent, budget_tokens=900).build(
+        "what is 2**3000?", extra_evidence=[calc], today=TODAY)
+    assert whole.evidence[0].text == big
+    small = BriefBuilder(telp.agent, budget_tokens=500)
+    cut = small.build("what is 2**3000?", extra_evidence=[calc], today=TODAY)
+    assert cut.evidence[0].kind == "tool"
+    assert cut.evidence[0].text.startswith("2**3000 = 1230231922")
+    assert cut.evidence[0].text.endswith("… (shortened)")
+    assert cut.token_estimate() <= 500 and small.dropped == []
+    listing = Evidence(n=0, text="results: " + "; ".join(
+        f"row {i}: value {i * 7}" for i in range(250)), kind="tool",
+        source="tool:search_memory")
+    brief = _builder(telp).build("list all the values",
+                                 extra_evidence=[listing], today=TODAY)
+    assert brief.evidence[0].text.endswith("… (shortened)")
+    # so many that not all fit: the first ones show, the rest are reported
+    many = [Evidence(n=0, text=f"Tool result {i} is a fairly long line of "
+                     f"text that says something useful.", kind="tool",
+                     source="tool:x") for i in range(40)]
+    crowded = small.build("hello", extra_evidence=many, today=TODAY)
+    shown = [e for e in crowded.evidence if e.kind == "tool"]
+    assert shown and len(shown) + len(small.dropped) == 40
+    assert [e.source for e in shown] == ["tool:x"] * len(shown)
+    assert small.dropped == many[len(shown):]
+    assert crowded.token_estimate() <= 500
+    # a blank result has nothing to show: no empty source, nothing dropped
+    blank = Evidence(n=0, text=" \n\t", source="tool:x", kind="tool")
+    quiet = small.build("hello", extra_evidence=[blank], today=TODAY)
+    assert quiet.evidence == [] and small.dropped == []
+
+
+def test_forget_matches_the_phrase_literally(fresh_state):
+    con = sqlite3.connect(str(fresh_state / "concept_bridge.db"))
+    state = ConversationState(con)
+    state.add_turn("I got a 50% discount on shoes", "Nice.")
+    state.add_turn("my car does 500 miles per tank", "Good mileage.")
+    state.add_turn("I paid $50 for dinner, then 30 for a taxi", "Ok.")
+    state.add_turn("my user_id is 7", "Noted.")
+    state.add_turn("tell me about users in iceland", "Ok.")
+    state.add_turn("Москва — столица России?", "Да.")
+    assert state.forget("50%") == 1
+    assert state.forget("user_id") == 1
+    assert state.forget("МОСКВА") == 1
+    assert [t["question"] for t in state.turns()] == [
+        "my car does 500 miles per tank",
+        "I paid $50 for dinner, then 30 for a taxi",
+        "tell me about users in iceland"]
+    con.close()
+
+
+def test_a_pasted_question_keeps_its_lines_and_indentation(telp):
+    code = ("why does this fail?\n\ndef f(x):\n    if x:\n        return 1\n"
+            "    return 2\n")
+    brief = _builder(telp).build(code, today=TODAY)
+    assert brief.question == code.rstrip("\n")
+    assert brief.messages()[1]["content"].endswith(
+        "Question: why does this fail?\n\ndef f(x):\n    if x:\n"
+        "        return 1\n    return 2")
+
+
+def test_a_possessive_question_finds_the_users_fact(telp):
+    for i in range(60):
+        telp.user_facts.add(f"User enjoys chewing toy number {i} in the "
+                            f"garden with friends.")
+    telp.user_facts.add("User's wife is Sarah Connor, a nurse.")
+    builder = _builder(telp)
+    for q in ("what is my wife's name?", "who is my wife?"):
+        brief = builder.build(q, today=TODAY)
+        assert "Sarah" not in brief.standing            # past the cap
+        assert [e.text for e in brief.evidence] == \
+            ["User's wife is Sarah Connor, a nurse."], q
+
+
+def test_old_citation_markers_of_every_form_are_dropped(fresh_state):
+    con = sqlite3.connect(str(fresh_state / "concept_bridge.db"))
+    state = ConversationState(con)
+    state.add_turn("who was Galileo?",
+                   "Galileo was an astronomer [1-3]. He was born in Pisa "
+                   "[Source 2].")
+    state.add_turn("and Kepler?", "Kepler was German [1–2] [^3] 【4】.")
+    text = state.summary("and Newton?", 300)
+    assert "Telp: Galileo was an astronomer. He was born in Pisa." in text
+    assert "Telp: Kepler was German." in text
+    assert "[" not in text and "【" not in text
+    assert "Source" not in text
+    con.close()
+
+
+def test_a_free_text_today_cannot_break_the_budget(telp):
+    builder = BriefBuilder(telp.agent, budget_tokens=500)
+    brief = builder.build("hi", today="the day after the big storm when " * 200)
+    assert brief.token_estimate() <= 500
+    assert brief.state.startswith("Today is the day after the big storm")
+    assert len(brief.state.split("\n")[0]) <= 80
