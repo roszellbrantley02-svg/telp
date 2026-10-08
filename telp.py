@@ -8,6 +8,11 @@ telp.py - THE door. One entry point to one mind.
     python telp.py seen                what Telp has seen
     python telp.py recall "a query"    find a sight by meaning
     python telp.py stats               memory stats
+    python telp.py llm "question"      ask through a local model (LM Studio):
+                                       Telp finds, works out and checks;
+                                       the model only writes
+    python telp.py llm-chat            the same as a conversation
+    python telp.py llm-status          is the model server up?
 
 Everything routes through the same organism: perception (lattice/vision) ->
 the one lattice memory -> the fluency cascade (mind/) -> voice. The retired
@@ -265,6 +270,139 @@ def cmd_stats(_args) -> int:
     return 0
 
 
+# ─── harness mode: Telp as memory + worker, a local model as the writer ──
+
+def _harness(args):
+    """A Harness on the one memory, talking to the model server at --url
+    (default: LM Studio, http://localhost:1234/v1, or $TELP_LLM_URL)."""
+    from mind.harness import Harness
+    from mind.llm_client import LLMClient
+    client = LLMClient(base_url=args.url, model=args.model)
+    return Harness(_fluent(), client, budget_tokens=args.budget,
+                   check=not args.no_check, session=args.session,
+                   thinking=False if args.no_think else None)
+
+
+def _llm_turn(h, text: str, stream: bool):
+    """Ask once and print the answer (streamed, or whole with Telp's
+    marks), any notes, and the token meter."""
+    from mind.harness import check_lines, meter_line
+    shown = {"answer": False, "thinking": False}
+
+    def token(piece: str) -> None:
+        shown["answer"] = True
+        print(piece, end="", flush=True)
+
+    def thinking(_piece: str) -> None:
+        # a slow model can think for a minute: say so once, not every token
+        if not shown["answer"] and not shown["thinking"]:
+            shown["thinking"] = True
+            print("(thinking...)", flush=True)
+
+    turn = h.ask(text, stream=stream, on_token=token if stream else None,
+                 on_thinking=thinking if stream else None)
+    if stream:
+        print()
+        if turn.handled_by == "llm":
+            for line in check_lines(turn):   # the check came after the text
+                print(line)
+    else:
+        print(turn.answer)
+    for note in getattr(turn, "notes", []):
+        print(f"note: {note}")
+    print(meter_line(turn))
+    return turn
+
+
+def cmd_llm(args) -> int:
+    """One question through the harness: Telp finds, filters, works out;
+    the model writes; Telp checks."""
+    try:
+        h = _harness(args)
+    except ValueError as e:                   # e.g. a --budget too small
+        print(f"[llm] {e}")
+        return 2
+    _llm_turn(h, " ".join(args.question), args.stream)
+    return 0
+
+
+def cmd_llm_chat(args) -> int:
+    """Talk through the harness. The conversation is kept in the memory
+    file, so it carries on where it left off."""
+    from mind.harness import meter_line, session_line, sources_text
+    try:
+        h = _harness(args)
+    except ValueError as e:
+        print(f"[llm-chat] {e}")
+        return 2
+    url = h.client.base_url
+    print(f"Telp + a local model at {url}. Telp remembers, searches and "
+          "checks; the model writes.")
+    print("/sources  the last turn's sources   /meter  tokens sent   "
+          "/new  start a fresh conversation   /quit")
+    earlier = h.state.count()
+    if earlier:
+        print(f"[llm-chat] carrying on our conversation ({earlier} earlier "
+              "turn(s); /new starts afresh).")
+    while True:
+        try:
+            line = input("you > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not line:
+            continue
+        cmd = line.lower()
+        if cmd in ("/quit", "/exit", "/q"):
+            break
+        if cmd == "/sources":
+            print(sources_text(h.last))
+        elif cmd == "/meter":
+            if h.last is not None:
+                print(meter_line(h.last))
+            print(session_line(h))
+        elif cmd == "/new":
+            n = h.state.clear()
+            print(f"[llm-chat] fresh conversation ({n} earlier turn(s) "
+                  "forgotten).")
+        elif cmd.startswith("/"):
+            print("[llm-chat] commands: /sources /meter /new /quit")
+        else:
+            _llm_turn(h, line, args.stream)
+        print()
+    return 0
+
+
+def cmd_llm_status(args) -> int:
+    """Is the model server up, which model, how much context."""
+    from mind.harness import status_lines
+    from mind.llm_client import LLMClient
+    info = LLMClient(base_url=args.url, model=args.model).status()
+    for line in status_lines(info, budget_tokens=args.budget):
+        print(line)
+    return 0 if info["reachable"] else 1
+
+
+def _llm_flags(sp, full: bool = True) -> None:
+    sp.add_argument("--url", default=None,
+                    help="model server (default $TELP_LLM_URL or "
+                         "http://localhost:1234/v1, LM Studio)")
+    sp.add_argument("--model", default=None,
+                    help="model id (default: the one the server has loaded)")
+    sp.add_argument("--budget", type=int, default=1800,
+                    help="tokens Telp may send the model per turn")
+    if not full:
+        return
+    sp.add_argument("--no-check", action="store_true",
+                    help="don't check the answer against the sources")
+    sp.add_argument("--stream", action="store_true",
+                    help="show the answer as the model writes it")
+    sp.add_argument("--no-think", action="store_true",
+                    help="ask the model not to think first (faster)")
+    sp.add_argument("--session", default="default",
+                    help="which conversation to continue")
+
+
 def main() -> int:
     import argparse
     # Windows consoles default to cp1252 - an essay quoting Greek
@@ -307,6 +445,19 @@ def main() -> int:
     sp.add_argument("what", nargs="+")
     sp.set_defaults(func=cmd_forget)
     sub.add_parser("stats", help="memory stats").set_defaults(func=cmd_stats)
+    sp = sub.add_parser("llm", help="ask through a local model (LM Studio): "
+                        "Telp finds and checks, the model writes")
+    sp.add_argument("question", nargs="+")
+    _llm_flags(sp)
+    sp.set_defaults(func=cmd_llm)
+    sp = sub.add_parser("llm-chat", help="talk through a local model "
+                        "(the conversation is remembered)")
+    _llm_flags(sp)
+    sp.set_defaults(func=cmd_llm_chat)
+    sp = sub.add_parser("llm-status", help="is the local model server up? "
+                        "which model, how much context")
+    _llm_flags(sp, full=False)
+    sp.set_defaults(func=cmd_llm_status)
 
     args = ap.parse_args()
     if args.cmd is None:
