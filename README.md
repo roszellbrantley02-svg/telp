@@ -98,8 +98,19 @@ python telp.py watch "https://www.youtube.com/watch?v=..."
 python telp.py learn "Photosynthesis"          # grow from Wikipedia
 python telp.py learn "https://any.url/doc"     # or any page
 python telp.py teach "My dog's name is Astro." # or from you
+python telp.py read report.pdf notes.docx      # read your own files
+python telp.py documents                       # what he has read
 python telp.py forget the video      # selective forgetting
 ```
+
+**Your files.** Give him a PDF, a Word file or a text file - `telp read file.pdf`, or
+in chat just type the path, or `read C:\Users\me\report.pdf`. He reads it sentence by
+sentence into the same memory (source `doc:report.pdf`, page numbers kept), so the
+fact routes answer from it directly, and when they miss he quotes the matching passage
+with its file and page: *From manual.pdf (page 2): The warranty lasts three years...*
+"What does report.pdf say about the budget?" searches inside that file; "how do you
+know?" cites it; reading a file again replaces the earlier reading; `forget the file
+report.pdf` erases it. Scanned PDFs (pictures of text) have no text to read yet.
 
 Models (MiniLM, CLIP, Whisper, EasyOCR) download from Hugging Face on first use to
 `TELP_MODEL_DIR` (default `~/.cache/telp`). ffmpeg on PATH (or `TELP_FFMPEG_DIR`) enables
@@ -114,7 +125,7 @@ imagination lane, or just let learn-on-miss fill him in as you talk.
 ## Running the tests
 
 ```bash
-pip install -r requirements-dev.txt     # numpy, scipy, Pillow, pytest
+pip install -r requirements-dev.txt     # numpy, scipy, Pillow, pypdf, python-docx, pytest
 python -m pytest
 ```
 

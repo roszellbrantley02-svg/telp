@@ -2224,6 +2224,150 @@ class FluentTelp:
         i = int(sims.argmax())
         return texts[i] if float(sims[i]) >= 0.32 else None
 
+    # ── Document route: read the user's own files, list them ──────────
+    _DOC_EXT_RX = re.compile(r"\.(?:pdf|docx|txt|md)\b", re.I)
+    _DOC_READ_RX = re.compile(
+        r"^(?:please\s+)?(?:read|open|load|ingest|learn|study|remember)\s+"
+        r"(?:this\s+|the\s+|my\s+)?(?:file\s+|document\s+|doc\s+|pdf\s+)?"
+        r"[\s:]*(?P<path>.+?)[\s.]*$", re.I)
+    _DOC_LIST_RX = re.compile(
+        r"^(?:what|which)\s+(?:files|documents|docs|pdfs)\s+(?:have\s+you|"
+        r"did\s+you|you(?:'ve|\s+have)?)\s+(?:read|got|seen|loaded)|"
+        r"^(?:list|show)\s+(?:me\s+)?(?:the\s+|your\s+|my\s+)?"
+        r"(?:files|documents|docs)\b", re.I)
+
+    def _document_route(self, user_msg: str, emotion) -> str | None:
+        from lattice.documents import (SUPPORTED, documents, read_document)
+        q = user_msg.strip()
+
+        def _say(body: str, domain: str = "document") -> str:
+            shaped = self.voice.shape_response(body, band="high",
+                                               emotion=emotion)
+            self.agent.turns.append({
+                "user": user_msg, "agent": shaped, "retrieved_memories": [],
+                "similarity": 1.0, "domain": domain, "emotion": emotion,
+            })
+            return shaped
+
+        if self._DOC_LIST_RX.match(q):
+            docs = documents(self.agent)
+            if not docs:
+                return _say("I haven't read any files yet. Drop one on me, "
+                            "or say: read C:\\path\\to\\file.pdf")
+            lines = [f"{d['name']} ({d['passages']} passages)" for d in docs]
+            return _say("I've read " + ", ".join(lines) + ".")
+
+        # a path to a readable file, bare or after "read ..."
+        path = None
+        if self._DOC_EXT_RX.search(q):
+            m = self._DOC_READ_RX.match(q)
+            cand = (m.group("path") if m else q).strip().strip("'\"")
+            if cand.lower().endswith(SUPPORTED) and Path(cand).expanduser(
+                    ).is_file():
+                path = cand
+            elif m and cand.lower().endswith(SUPPORTED):
+                return _say(f"I can't find a file at {cand} - check the "
+                            "path and try again.", "abstain")
+        if path is None:
+            return None
+        r = read_document(self.agent, path)
+        if r["error"]:
+            return _say(f"I couldn't read {r['title']}: {r['error']}.",
+                        "abstain")
+        try:
+            self.agent._rebuild_structured_qa()
+        except Exception:
+            pass
+        pages = f" - {r['pages']} pages," if r["pages"] else ":"
+        again = (" I replaced what I'd read from it before."
+                 if r["replaced"] else "")
+        return _say(f"I've read {r['title']}{pages} {r['added']} passages "
+                    f"remembered.{again} Ask me anything about it.")
+
+    # words about the file rather than its contents
+    _DOC_TALK = frozenset((
+        "say", "says", "said", "saying", "mention", "mentions", "mentioned",
+        "tell", "tells", "file", "files", "document", "documents", "doc",
+        "docs", "pdf", "docx", "txt", "md", "page", "pages", "according",
+        "about", "read", "written", "write", "contain", "contains"))
+
+    def _document_answer(self, user_msg: str, emotion) -> str | None:
+        """When the fact routes miss but the question's words land in a
+        file the user gave Telp, answer with the matching passage and say
+        which file (and page) it came from. Quoting the user's own
+        document is honest and useful; guessing around it is neither."""
+        from lattice.documents import SOURCE_PREFIX
+        lat = self.agent.lattice
+        if not any(s.startswith(SOURCE_PREFIX) for s in lat._sources):
+            return None
+        if not self.agent._looks_like_question(user_msg):
+            return None
+        # "what does manual.pdf say about the warranty?": the named file
+        # narrows the search, and the file words aren't the question
+        from lattice.documents import documents
+        low = user_msg.lower()
+        named = [d["name"] for d in documents(self.agent)
+                 if d["name"].lower() in low
+                 or re.search(r"\b" + re.escape(Path(d["name"]).stem.lower())
+                              + r"\b", low)]
+        q_words = self.agent._content_words(user_msg) - self._DOC_TALK
+        for n in named:
+            q_words -= self.agent._content_words(n)
+        q_stems = self.agent._stems(q_words)
+        if not q_stems:
+            return None
+        sims = {}
+        try:
+            for h in lat.query(user_msg, k=40):
+                sims[h["id"]] = float(h.get("similarity", 0.0))
+        except Exception:
+            pass
+        scored = []
+        wanted = {SOURCE_PREFIX + n for n in named}
+        for mid, text, src in zip(lat._ids, lat._texts, lat._sources):
+            if not src.startswith(SOURCE_PREFIX):
+                continue
+            if wanted and src not in wanted:
+                continue
+            overlap = len(q_stems & self.agent._stems(
+                self.agent._content_words(text)))
+            if not overlap:
+                continue
+            sim = sims.get(mid, 0.0)
+            # two shared words, or one plus a real meaning match - or any
+            # shared word inside the file the question names
+            if overlap < 2 and sim < 0.30 and not wanted:
+                continue
+            scored.append((overlap / len(q_stems) + sim, mid, text, src))
+        if not scored:
+            return None
+        scored.sort(key=lambda t: -t[0])
+        best = scored[0]
+        picks = [best]
+        # a close second from the same file adds context, not noise
+        if len(scored) > 1 and scored[1][0] >= best[0] * 0.8 \
+                and scored[1][3] == best[3]:
+            picks.append(scored[1])
+        name = best[3][len(SOURCE_PREFIX):]
+        page = None
+        try:
+            row = lat.get(best[1]) or {}
+            page = (row.get("metadata") or {}).get("page")
+        except Exception:
+            pass
+        where = f"{name} (page {page})" if page else name
+        # a quotation with its citation is left as it is: no opener, no
+        # restyling of the user's own words
+        body = f"From {where}: " + " ".join(t[2] for t in picks)
+        self._update_topic_words(body)
+        self.agent.turns.append({
+            "user": user_msg, "agent": body,
+            "retrieved_memories": [t[2] for t in picks],
+            "similarity": max(sims.get(t[1], 0.0) for t in picks),
+            "domain": "document",
+        })
+        return body
+
     # ── Forget route: "forget ..." actually erases memories ────────────
     def _forget_route(self, user_msg: str, emotion) -> str | None:
         q = user_msg.lower().strip()
@@ -2231,8 +2375,20 @@ class FluentTelp:
             return None
         try:
             from lattice.vision import forget, watched
+            from lattice.documents import find_document, forget_document
             db = self.agent.lattice.db_path
-            if any(w in q for w in ("video", "watch", "movie", "clip", "film")):
+            doc_target = q.removeprefix("forget").strip(" :,.-")
+            for filler in ("that you read", "what you read", "about",
+                           "the file", "the document", "the doc", "the pdf",
+                           "file", "document", "the "):
+                doc_target = doc_target.replace(filler, " ").strip()
+            doc_name = find_document(self.agent, doc_target) \
+                if doc_target else None
+            if doc_name:
+                gone = forget_document(self.agent, doc_name)
+                body = (f"Done - I've forgotten the file '{doc_name}': "
+                        f"{len(gone)} passages erased.")
+            elif any(w in q for w in ("video", "watch", "movie", "clip", "film")):
                 vids = watched(db)
                 if not vids:
                     body = "I haven't watched any videos, so there's nothing to forget."
@@ -2437,6 +2593,8 @@ class FluentTelp:
                               "WHERE text=?", (text,)).fetchone()
             if row:
                 src = row[0] or "our conversations"
+                if src.startswith("doc:"):
+                    src = f"the file {src[4:]}"
                 cites.append(f"{src} (saved {str(row[1])[:10]})")
         con.close()
         if cites:
@@ -2968,7 +3126,10 @@ class FluentTelp:
         except Exception:
             emotion = None
 
-        # ── Memory discipline: forgetting + provenance ──────────────
+        # ── Memory discipline: reading files, forgetting, provenance ──
+        d = self._document_route(user_msg, emotion)
+        if d is not None:
+            return d
         f = self._forget_route(user_msg, emotion)
         if f is not None:
             return f
@@ -3467,6 +3628,11 @@ class FluentTelp:
         force_miss = self._facet_miss(user_msg, raw)
 
         if _looks_like_abstention(raw) or band == "none" or force_miss:
+            # the user's own files come before the web: a passage that
+            # matches the question is the answer, with its citation
+            doc = self._document_answer(user_msg, emotion)
+            if doc is not None:
+                return doc
             # LEARN-ON-MISS (2026-07-02): before giving up, go find it -
             # fetch the topic (Wikipedia, attributed source), grow the
             # memory, answer from what was just learned.
@@ -3482,6 +3648,9 @@ class FluentTelp:
         # lists, FAQs, lowercase fragments) from leaking through this
         # single-doc fallback path the same way multi-doc filters them.
         if self._md_text_quality(raw) < 0.5:
+            doc = self._document_answer(user_msg, emotion)
+            if doc is not None:
+                return doc
             self.last_topic_words.clear()
             self._mark_abstained(user_msg, emotion)
             return self._abstain()

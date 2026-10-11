@@ -4,4 +4,6 @@
 numpy
 scipy
 Pillow
+pypdf                   # the document reader (tests build small PDFs)
+python-docx
 pytest

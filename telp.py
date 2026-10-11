@@ -257,6 +257,39 @@ def cmd_teach(args) -> int:
     return 0
 
 
+def cmd_read(args) -> int:
+    """Read the user's own files (PDF, Word, text) into memory."""
+    from lattice.vision import CHAT_LATTICE
+    from lattice.standalone_agent import StandaloneAgent
+    from lattice.documents import read_document
+    agent = StandaloneAgent(lattice_path=CHAT_LATTICE, skip_ngram_retrain=True)
+    rc = 0
+    for f in args.files:
+        r = read_document(agent, f)
+        if r["error"]:
+            print(f"[read] {r['title']}: {r['error']}")
+            rc = 1
+        else:
+            pages = f" ({r['pages']} pages)" if r["pages"] else ""
+            again = " (replacing the earlier reading)" if r["replaced"] else ""
+            print(f"[read] {r['title']}{pages}: {r['added']} passages "
+                  f"remembered{again}")
+    return rc
+
+
+def cmd_documents(_args) -> int:
+    from lattice.vision import CHAT_LATTICE
+    from lattice.standalone_agent import StandaloneAgent
+    from lattice.documents import documents
+    agent = StandaloneAgent(lattice_path=CHAT_LATTICE, skip_ngram_retrain=True)
+    docs = documents(agent)
+    if not docs:
+        print("  (no files read yet - try: telp read report.pdf)")
+    for d in docs:
+        print(f"  {d['name']}: {d['passages']} passages")
+    return 0
+
+
 def cmd_forget(args) -> int:
     t = _fluent()
     print(t.respond("forget " + " ".join(args.what)))
@@ -469,6 +502,11 @@ def main() -> int:
     sp = sub.add_parser("teach", help="teach Telp a fact directly")
     sp.add_argument("fact", nargs="+")
     sp.set_defaults(func=cmd_teach)
+    sp = sub.add_parser("read", help="read PDF, Word or text files into memory")
+    sp.add_argument("files", nargs="+")
+    sp.set_defaults(func=cmd_read)
+    sub.add_parser("documents", help="list the files Telp has read"
+                   ).set_defaults(func=cmd_documents)
     sp = sub.add_parser("forget", help="forget specific memories on command")
     sp.add_argument("what", nargs="+")
     sp.set_defaults(func=cmd_forget)

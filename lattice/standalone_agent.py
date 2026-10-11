@@ -217,7 +217,7 @@ class StandaloneAgent:
     # youtube: (transcripts) added so YouTube-learned claims survive a
     # restart; video:/image: rows are perception logs, not claims
     _CORPUS_PREFIXES = ("wikipedia:", "user_taught", "identity", "wisdom:",
-                        "legacy:", "url:", "code:", "youtube:")
+                        "legacy:", "url:", "code:", "youtube:", "doc:")
 
     def _corpus_sentences(self) -> list[str]:
         return [t for t, s in zip(self.lattice._texts, self.lattice._sources)
@@ -884,10 +884,14 @@ class StandaloneAgent:
             return self._title_idx
         idx: dict[str, list[int]] = {}
         for i, src in enumerate(self.lattice._sources):
-            if not src.startswith("wikipedia:"):
+            # doc: rows are keyed by the file name, so "what does the
+            # harlow report say" reaches every passage of harlow_report.pdf
+            if not src.startswith(("wikipedia:", "doc:")):
                 continue
             topic = src.split(":", 1)[1].lower()
-            for tok in re.split(r"[_\s-]+", topic):
+            if src.startswith("doc:"):
+                topic = topic.rsplit(".", 1)[0]
+            for tok in re.split(r"[_\s.-]+", topic):
                 if not tok or len(tok) < 2:
                     continue
                 idx.setdefault(tok, []).append(i)
